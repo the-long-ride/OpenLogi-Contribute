@@ -1,0 +1,170 @@
+name: Windows x64 Installer (Manual)
+
+# Select any branch from the GitHub Actions "Run workflow" menu.
+# This workflow only creates unsigned run artifacts; it never publishes a release.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-x64-manual-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Keep portable binaries independent of the Visual C++ Redistributable.
+  RUSTFLAGS: -C target-feature=+crt-static
+  TARGET: x86_64-pc-windows-msvc
+  WIX_VERSION: "6.0.2"
+
+jobs:
+  build-installer:
+    name: Build unsigned Windows x64 artifacts
+    runs-on: windows-2025
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out selected branch
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Verify Node.js runtime
+        shell: pwsh
+        run: |
+          $version = node --version
+          Write-Host "Node.js $version"
+          if ($version -notmatch '^v24\.') {
+            throw "Expected Node.js 24, got $version"
+          }
+
+      - name: Set up Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup target add $env:TARGET --toolchain stable
+          rustc --version
+          cargo --version
+
+      - name: Build OpenLogi GUI and agent
+        shell: pwsh
+        run: |
+          cargo build --locked --release `
+            -p openlogi-gui `
+            -p openlogi-agent `
+            --target $env:TARGET
+
+      - name: Resolve package names and version
+        id: package
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $package = $metadata.packages |
+            Where-Object { $_.name -eq 'openlogi-gui' } |
+            Select-Object -First 1
+
+          if ($null -eq $package) {
+            throw 'Could not find openlogi-gui in Cargo metadata.'
+          }
+
+          $version = $package.version
+          if ($version -notmatch '^(\d+)\.(\d+)\.(\d+)') {
+            throw "Cargo version '$version' cannot be converted to an MSI ProductVersion."
+          }
+
+          $msiVersion = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+          $safeRef = $env:GITHUB_REF_NAME -replace '[^A-Za-z0-9._-]', '-'
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $baseName = "OpenLogi-$version-$safeRef-$shortSha-windows-x86_64"
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "msi_version=$msiVersion" >> $env:GITHUB_OUTPUT
+          "base_name=$baseName" >> $env:GITHUB_OUTPUT
+
+      - name: Create portable ZIP
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path stage, dist | Out-Null
+
+          $releaseDir = "target\$env:TARGET\release"
+          Copy-Item "$releaseDir\openlogi-gui.exe" stage\OpenLogi.exe
+          Copy-Item "$releaseDir\openlogi-agent.exe" stage\openlogi-agent.exe
+
+          Compress-Archive `
+            -Path stage\* `
+            -DestinationPath "dist\${{ steps.package.outputs.base_name }}.zip" `
+            -CompressionLevel Optimal
+
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version $env:WIX_VERSION
+          wix extension add --global "WixToolset.Util.wixext/$env:WIX_VERSION"
+          wix --version
+
+      - name: Build unsigned MSI
+        shell: pwsh
+        run: |
+          $gui = (Resolve-Path stage\OpenLogi.exe).Path
+          $agent = (Resolve-Path stage\openlogi-agent.exe).Path
+
+          wix build packaging\windows\OpenLogi.wxs `
+            -ext WixToolset.Util.wixext `
+            -arch x64 `
+            -d Version=${{ steps.package.outputs.msi_version }} `
+            -d ExeFile="$gui" `
+            -d AgentExeFile="$agent" `
+            -o "dist\${{ steps.package.outputs.base_name }}.msi"
+
+      - name: Verify artifacts and create checksums
+        shell: pwsh
+        run: |
+          $expected = @(
+            "dist\${{ steps.package.outputs.base_name }}.zip",
+            "dist\${{ steps.package.outputs.base_name }}.msi"
+          )
+
+          foreach ($path in $expected) {
+            $file = Get-Item $path -ErrorAction Stop
+            if ($file.Length -le 0) {
+              throw "Artifact is empty: $path"
+            }
+            Write-Host "$($file.Name): $($file.Length) bytes"
+          }
+
+          $lines = foreach ($path in $expected) {
+            $file = Get-Item $path
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($file.Name)"
+          }
+
+          [System.IO.File]::WriteAllLines(
+            (Join-Path $PWD 'dist\SHA256SUMS'),
+            $lines,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+          "### Windows x64 build" >> $env:GITHUB_STEP_SUMMARY
+          "" >> $env:GITHUB_STEP_SUMMARY
+          "- Source: ``$env:GITHUB_REF_NAME`` at ``$($env:GITHUB_SHA.Substring(0, 7))``" >> $env:GITHUB_STEP_SUMMARY
+          "- Version: ``${{ steps.package.outputs.version }}``" >> $env:GITHUB_STEP_SUMMARY
+          "- Outputs: portable ZIP, MSI installer, SHA-256 checksums" >> $env:GITHUB_STEP_SUMMARY
+          "- Signing: **unsigned manual build**" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload Windows x64 artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenLogi-windows-x86_64-${{ github.run_number }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

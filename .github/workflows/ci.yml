@@ -5,6 +5,7 @@ name: CI
 # Changing a `run:` here without updating those two is a bug.
 
 on:
+  workflow_dispatch:
   push:
     branches: [main, master]
   pull_request:
