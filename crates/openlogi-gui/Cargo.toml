@@ -59,6 +59,22 @@ succession = "0.1"
 [build-dependencies]
 embed-resource = "3.0.9"
 
+# The Actions Ring overlay keeps one native window warm where the windowing
+# backend exposes safe hide/show/reposition primitives. raw-window-handle lets
+# the Windows and X11 implementations identify GPUI's existing native window.
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+raw-window-handle = "0.6.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.13.2"
+
 # Menu-bar (NSStatusItem) FFI — GPUI has no status-bar API. objc2 gives typed,
 # `Retained<T>`-owned AppKit bindings so the status-item code can't leak (#99).
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -66,8 +82,9 @@ embed-resource = "3.0.9"
 # display needs global display bounds, which GPUI's display API doesn't expose
 # (its bounds are display-relative). C FFI, so core-graphics per platform/AGENTS.md.
 core-graphics = { workspace = true }
+core-foundation = { workspace = true }
 objc2 = { workspace = true }
-objc2-app-kit = { workspace = true, features = ["NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSResponder", "NSView", "NSMenu", "NSMenuItem", "NSImage", "NSApplication", "NSAppearance", "NSWindow", "NSEvent", "block2"] }
+objc2-app-kit = { workspace = true, features = ["NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSResponder", "NSView", "NSMenu", "NSMenuItem", "NSImage", "NSApplication", "NSAppearance", "NSWindow", "NSGraphics", "NSWorkspace", "NSRunningApplication", "NSEvent", "NSScreen", "block2", "libc"] }
 objc2-foundation = { workspace = true, features = ["NSString", "NSProcessInfo"] }
 # Input-Monitoring status (`IOHIDCheckAccess`) with typed request/access enums —
 # see platform/permissions.rs.

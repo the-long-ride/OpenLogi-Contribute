@@ -48,7 +48,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
-const WINDOW_SIZE: f32 = 360.0;
+const WINDOW_SIZE: f32 = 324.0;
 const SLOT_SIZE: f32 = 54.0;
 const RADIUS: f32 = 122.0;
 
@@ -79,9 +79,11 @@ struct Ipc {
 }
 
 struct RingView {
-    invocation: ActionRingInvocation,
+    invocation: Option<ActionRingInvocation>,
     commands: mpsc::UnboundedSender<OverlayCommand>,
     hovered: Option<ActionRingSlot>,
+    live_session: Arc<ClickAwaySession>,
+    persistent: bool,
 }
 
 impl RingView {
@@ -93,16 +95,51 @@ impl RingView {
         )
     }
 
+    fn current_session(&self) -> Option<u64> {
+        self.invocation
+            .as_ref()
+            .map(|invocation| invocation.session_id)
+    }
+
+    fn install(&mut self, invocation: ActionRingInvocation, cx: &mut Context<Self>) {
+        self.hovered = None;
+        self.invocation = Some(invocation);
+        cx.notify();
+    }
+
+    fn hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hovered = None;
+        self.invocation = None;
+        self.live_session.clear();
+        cx.notify();
+        if self.persistent {
+            if !overlay_platform::hide_window(window) {
+                warn!("could not hide warm Actions Ring window");
+            }
+        } else {
+            window.remove_window();
+        }
+    }
+
+    fn dismiss(&mut self, session_id: u64, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !session_targets(session_id, self.current_session()) {
+            return false;
+        }
+        self.hide(window, cx);
+        true
+    }
+
     fn slot_element(
         &self,
         slot: ActionRingSlot,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        let presentation = self.invocation.slots.get(&slot)?;
+        let invocation = self.invocation.as_ref()?;
+        let presentation = invocation.slots.get(&slot)?;
         let icon_path = action_ring_icons::ring_icon_path(presentation.icon);
         let selected = self.hovered == Some(slot);
         let (left, top) = Self::slot_position(slot);
-        let session_id = self.invocation.session_id;
+        let session_id = invocation.session_id;
         let activate = self.commands.clone();
         Some(
             div()
@@ -144,23 +181,31 @@ impl RingView {
                         cx.notify();
                     }
                 }))
-                .on_click(move |_, window, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
                     let _ = activate.send(OverlayCommand::Activate { session_id, slot });
-                    window.remove_window();
-                })
+                    this.dismiss(session_id, window, cx);
+                }))
                 .into_any_element(),
         )
     }
 }
 
+#[must_use]
+const fn session_targets(session_id: u64, open_session: Option<u64>) -> bool {
+    matches!(open_session, Some(open) if open == session_id)
+}
+
 impl Render for RingView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let session_id = self.invocation.session_id;
+        let Some(invocation) = self.invocation.clone() else {
+            return div().id("ring-root-idle").size_full();
+        };
+        let session_id = invocation.session_id;
         let root_commands = self.commands.clone();
         let center_commands = self.commands.clone();
         let hovered_label = self.hovered.and_then(|slot| {
-            let presentation = self.invocation.slots.get(&slot)?;
+            let presentation = invocation.slots.get(&slot)?;
             // User-authored labels render verbatim: passing them through the
             // localization table would translate any label that happens to
             // collide with a known key ("Copy" → "Copier" under fr).
@@ -180,16 +225,8 @@ impl Render for RingView {
             .id("ring-root")
             .relative()
             .size_full()
-            .child(
-                div()
-                    .absolute()
-                    .left(px(18.0))
-                    .top(px(18.0))
-                    .size(px(WINDOW_SIZE - 36.0))
-                    .rounded_full()
-                    .bg(hsla(0.0, 0.0, 0.06, 0.82))
-                    .shadow_lg(),
-            )
+            .rounded_full()
+            .bg(hsla(0.0, 0.0, 0.06, 0.82))
             .children(slots)
             .child(
                 div()
@@ -207,11 +244,11 @@ impl Render for RingView {
                     .text_lg()
                     .cursor_pointer()
                     .child("×")
-                    .on_click(move |_, window, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         let _ = center_commands.send(OverlayCommand::Cancel { session_id });
-                        window.remove_window();
-                    }),
+                        this.dismiss(session_id, window, cx);
+                    })),
             )
             .when_some(hovered_label, |ring, label| {
                 ring.child(
@@ -226,10 +263,10 @@ impl Render for RingView {
                         .child(label),
                 )
             })
-            .on_click(move |_, window, _| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 let _ = root_commands.send(OverlayCommand::Cancel { session_id });
-                window.remove_window();
-            })
+                this.dismiss(session_id, window, cx);
+            }))
     }
 }
 
@@ -254,62 +291,204 @@ fn main() -> Result<()> {
         overlay_platform::configure_application();
         let live_session = Arc::new(ClickAwaySession::new());
         spawn_click_away_dismissal(cx, Arc::clone(&live_session));
+
+        let warm_window = create_warm_window(cx, commands.clone(), Arc::clone(&live_session));
+
         cx.spawn(async move |cx| {
             while let Some(invocation) = invocations.recv().await {
-                // An empty invocation is the agent's dismissal signal (second
-                // trigger press): close any showing ring, open nothing, and
-                // acknowledge so the agent can clear the placeholder session.
-                if invocation.slots.is_empty() {
-                    cx.update(|cx| {
-                        for handle in cx.windows() {
-                            let _ = handle.update(cx, |_, window, _| window.remove_window());
-                        }
-                    });
-                    let _ = commands.send(OverlayCommand::Cancel {
-                        session_id: invocation.session_id,
-                    });
-                    continue;
+                if let Some(warm_window) = warm_window.as_ref() {
+                    handle_warm_invocation(cx, warm_window, invocation, &commands, &live_session);
+                } else {
+                    handle_cold_invocation(cx, invocation, &commands, &live_session);
                 }
-                rust_i18n::set_locale(locale::resolve(invocation.language.as_deref()));
-                cx.update(|cx| {
-                    live_session.clear();
-                    for handle in cx.windows() {
-                        let _ = handle.update(cx, |_, window, _| window.remove_window());
-                    }
-                    let options = ring_window_options(cx);
-                    let commands = commands.clone();
-                    let timeout_commands = commands.clone();
-                    let session_id = invocation.session_id;
-                    match cx.open_window(options, |_, cx| {
-                        cx.new(|_| RingView {
-                            invocation,
-                            commands,
-                            hovered: None,
-                        })
-                    }) {
-                        Ok(handle) => {
-                            live_session.set(session_id);
-                            overlay_platform::configure_windows();
-                            cx.spawn(async move |cx| {
-                                cx.background_executor().timer(DISPLAY_LIFETIME).await;
-                                if handle
-                                    .update(cx, |_, window, _| window.remove_window())
-                                    .is_ok()
-                                {
-                                    let _ = timeout_commands
-                                        .send(OverlayCommand::Cancel { session_id });
-                                }
-                            })
-                            .detach();
-                        }
-                        Err(error) => warn!(%error, "could not open Actions Ring window"),
-                    }
-                });
             }
         })
         .detach();
     });
     Ok(())
+}
+
+/// Pre-create the Actions Ring native window once. Windows, macOS and X11 can
+/// reuse it; Wayland intentionally falls back to the existing create/destroy
+/// path because the compositor does not expose arbitrary global popup moves.
+///
+/// The warm window is created with `show: true` exactly once so GPUI applies
+/// its requested logical bounds and DPI-aware native placement. The idle view
+/// is fully transparent, and the native window is hidden immediately after
+/// creation. Later opens only reposition/show this correctly-sized HWND.
+fn create_warm_window(
+    cx: &mut gpui::App,
+    commands: mpsc::UnboundedSender<OverlayCommand>,
+    live_session: Arc<ClickAwaySession>,
+) -> Option<gpui::WindowHandle<RingView>> {
+    let options = ring_window_options(cx, true);
+    let handle = match cx.open_window(options, |_, cx| {
+        cx.new(|_| RingView {
+            invocation: None,
+            commands,
+            hovered: None,
+            live_session,
+            persistent: true,
+        })
+    }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            warn!(%error, "could not pre-create Actions Ring window; using cold overlay path");
+            return None;
+        }
+    };
+    overlay_platform::configure_windows();
+
+    let reusable = handle
+        .update(cx, |_, window, _| {
+            overlay_platform::supports_warm_window(window) && overlay_platform::hide_window(window)
+        })
+        .unwrap_or(false);
+    if reusable {
+        debug!("Actions Ring native window warmed and waiting hidden");
+        Some(handle)
+    } else {
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+        debug!("Actions Ring backend requires cold window creation");
+        None
+    }
+}
+
+fn handle_warm_invocation(
+    cx: &mut gpui::AsyncApp,
+    warm_window: &gpui::WindowHandle<RingView>,
+    invocation: ActionRingInvocation,
+    commands: &mpsc::UnboundedSender<OverlayCommand>,
+    live_session: &Arc<ClickAwaySession>,
+) {
+    // Empty is the agent's second-trigger dismissal signal. Keep the original
+    // first-press-open / second-press-close behavior, but hide the persistent
+    // native window instead of destroying it.
+    if invocation.slots.is_empty() {
+        let placeholder_session = invocation.session_id;
+        cx.update(|cx| {
+            let _ = warm_window.update(cx, |view, window, cx| {
+                if let Some(open_session) = view.current_session() {
+                    view.dismiss(open_session, window, cx);
+                } else {
+                    live_session.clear();
+                    if !overlay_platform::hide_window(window) {
+                        warn!("could not hide warm Actions Ring window");
+                    }
+                }
+            });
+        });
+        let _ = commands.send(OverlayCommand::Cancel {
+            session_id: placeholder_session,
+        });
+        return;
+    }
+
+    rust_i18n::set_locale(locale::resolve(invocation.language.as_deref()));
+    let session_id = invocation.session_id;
+    let timeout_commands = commands.clone();
+    let show_started = Instant::now();
+    let shown = cx.update(|cx| {
+        warm_window
+            .update(cx, |view, window, cx| {
+                view.install(invocation, cx);
+                window.refresh();
+                if overlay_platform::show_window_at_cursor(window) {
+                    live_session.set(session_id);
+                    true
+                } else {
+                    warn!("could not position/show warm Actions Ring window");
+                    view.dismiss(session_id, window, cx);
+                    false
+                }
+            })
+            .unwrap_or(false)
+    });
+
+    if !shown {
+        let _ = commands.send(OverlayCommand::Cancel { session_id });
+        return;
+    }
+    debug!(
+        session_id,
+        elapsed = ?show_started.elapsed(),
+        "Actions Ring warm window shown"
+    );
+
+    let timeout_window = *warm_window;
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(DISPLAY_LIFETIME).await;
+        let dismissed = timeout_window
+            .update(cx, |view, window, cx| view.dismiss(session_id, window, cx))
+            .unwrap_or(false);
+        if dismissed {
+            let _ = timeout_commands.send(OverlayCommand::Cancel { session_id });
+        }
+    })
+    .detach();
+}
+
+fn handle_cold_invocation(
+    cx: &mut gpui::AsyncApp,
+    invocation: ActionRingInvocation,
+    commands: &mpsc::UnboundedSender<OverlayCommand>,
+    live_session: &Arc<ClickAwaySession>,
+) {
+    // Keep the existing create/destroy path on platforms where GPUI does not
+    // expose a safe, public reusable-window visibility/move primitive.
+    if invocation.slots.is_empty() {
+        cx.update(|cx| {
+            live_session.clear();
+            for handle in cx.windows() {
+                let _ = handle.update(cx, |_, window, _| window.remove_window());
+            }
+        });
+        let _ = commands.send(OverlayCommand::Cancel {
+            session_id: invocation.session_id,
+        });
+        return;
+    }
+
+    rust_i18n::set_locale(locale::resolve(invocation.language.as_deref()));
+    let commands = commands.clone();
+    let timeout_commands = commands.clone();
+    let live_session = Arc::clone(live_session);
+    cx.update(|cx| {
+        let previous_windows = cx.windows();
+        let options = ring_window_options(cx, true);
+        let session_id = invocation.session_id;
+        match cx.open_window(options, |_, cx| {
+            cx.new(|_| RingView {
+                invocation: Some(invocation),
+                commands,
+                hovered: None,
+                live_session: Arc::clone(&live_session),
+                persistent: false,
+            })
+        }) {
+            Ok(handle) => {
+                let _ = handle.update(cx, |_, window, _| {
+                    overlay_platform::apply_circular_shape(window)
+                });
+                live_session.set(session_id);
+                for previous in previous_windows {
+                    let _ = previous.update(cx, |_, window, _| window.remove_window());
+                }
+                overlay_platform::configure_windows();
+                cx.spawn(async move |cx| {
+                    cx.background_executor().timer(DISPLAY_LIFETIME).await;
+                    let dismissed = handle
+                        .update(cx, |view, window, cx| view.dismiss(session_id, window, cx))
+                        .unwrap_or(false);
+                    if dismissed {
+                        let _ = timeout_commands.send(OverlayCommand::Cancel { session_id });
+                    }
+                })
+                .detach();
+            }
+            Err(error) => warn!(%error, "could not open Actions Ring window"),
+        }
+    });
 }
 
 /// Session the click-away monitor may dismiss; `0` means no ring is showing.
@@ -391,14 +570,17 @@ fn dismiss_click_away(cx: &mut gpui::App, session_id: u64) {
         let Some(ring) = handle.downcast::<RingView>() else {
             continue;
         };
-        let _ = ring.update(cx, |view, window, _| {
-            if !click_away_targets(session_id, view.invocation.session_id) {
+        let _ = ring.update(cx, |view, window, cx| {
+            let Some(open_session) = view.current_session() else {
+                return;
+            };
+            if !click_away_targets(session_id, open_session) {
                 return;
             }
             let _ = view.commands.send(OverlayCommand::Cancel {
-                session_id: view.invocation.session_id,
+                session_id: open_session,
             });
-            window.remove_window();
+            view.dismiss(open_session, window, cx);
         });
     }
 }
@@ -407,7 +589,7 @@ fn dismiss_click_away(cx: &mut gpui::App, session_id: u64) {
     clippy::cast_possible_truncation,
     reason = "native cursor coordinates are screen-sized and exactly usable as GPUI f32 pixels"
 )]
-fn ring_window_options(cx: &mut gpui::App) -> WindowOptions {
+fn ring_window_options(cx: &mut gpui::App, show: bool) -> WindowOptions {
     let cursor = openlogi_hook::cursor_position();
     let size = Size::new(px(WINDOW_SIZE), px(WINDOW_SIZE));
     // GPUI window bounds are display-relative (`display.bounds()` zeroes every
@@ -459,7 +641,7 @@ fn ring_window_options(cx: &mut gpui::App) -> WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: None,
         focus: false,
-        show: true,
+        show,
         kind: WindowKind::PopUp,
         is_movable: false,
         is_resizable: false,
@@ -1013,6 +1195,13 @@ mod tests {
             clamp_window_origin(desired, Size::new(px(400.0), px(400.0)), display),
             desired
         );
+    }
+
+    #[test]
+    fn stale_session_cannot_dismiss_reused_window() {
+        assert!(session_targets(12, Some(12)));
+        assert!(!session_targets(11, Some(12)));
+        assert!(!session_targets(12, None));
     }
 
     #[test]
