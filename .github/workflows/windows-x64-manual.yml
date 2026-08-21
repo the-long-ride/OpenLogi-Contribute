@@ -55,12 +55,14 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Build OpenLogi GUI and agent
+      - name: Build OpenLogi executables
         shell: pwsh
         run: |
           cargo build --locked --release `
             -p openlogi-desktop `
+            -p openlogi-overlay `
             -p openlogi-agent `
+            -p openlogi `
             --target $env:TARGET
 
       - name: Resolve package names and version
@@ -93,11 +95,18 @@ jobs:
       - name: Create portable ZIP
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path stage, dist | Out-Null
+          New-Item -ItemType Directory -Force -Path stage, dist, stage\bin | Out-Null
 
           $releaseDir = "target\$env:TARGET\release"
           Copy-Item "$releaseDir\openlogi-desktop.exe" stage\OpenLogi.exe
+          Copy-Item "$releaseDir\openlogi-overlay.exe" stage\openlogi-overlay.exe
           Copy-Item "$releaseDir\openlogi-agent.exe" stage\openlogi-agent.exe
+          Copy-Item "$releaseDir\openlogi.exe" stage\bin\openlogi.exe
+
+          $staged = (Get-ChildItem stage -Recurse -File).Count
+          if ($staged -ne 4) {
+            throw "Expected 4 staged executables, found $staged."
+          }
 
           Compress-Archive `
             -Path stage\* `
@@ -115,7 +124,9 @@ jobs:
         shell: pwsh
         run: |
           $gui = (Resolve-Path stage\OpenLogi.exe).Path
+          $overlay = (Resolve-Path stage\openlogi-overlay.exe).Path
           $agent = (Resolve-Path stage\openlogi-agent.exe).Path
+          $cli = (Resolve-Path stage\bin\openlogi.exe).Path
 
           wix build packaging\windows\OpenLogi.wxs `
             -ext WixToolset.Util.wixext `
@@ -123,6 +134,8 @@ jobs:
             -d Version=${{ steps.package.outputs.msi_version }} `
             -d ExeFile="$gui" `
             -d AgentExeFile="$agent" `
+            -d OverlayExeFile="$overlay" `
+            -d CliExeFile="$cli" `
             -o "dist\${{ steps.package.outputs.base_name }}.msi"
 
       - name: Verify artifacts and create checksums
