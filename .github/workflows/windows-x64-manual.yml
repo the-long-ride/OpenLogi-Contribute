@@ -59,7 +59,7 @@ jobs:
         shell: pwsh
         run: |
           cargo build --locked --release `
-            -p openlogi-gui `
+            -p openlogi-desktop `
             -p openlogi-agent `
             --target $env:TARGET
 
@@ -69,11 +69,11 @@ jobs:
         run: |
           $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
           $package = $metadata.packages |
-            Where-Object { $_.name -eq 'openlogi-gui' } |
+            Where-Object { $_.name -eq 'openlogi-desktop' } |
             Select-Object -First 1
 
           if ($null -eq $package) {
-            throw 'Could not find openlogi-gui in Cargo metadata.'
+            throw 'Could not find openlogi-desktop in Cargo metadata.'
           }
 
           $version = $package.version
@@ -96,7 +96,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path stage, dist | Out-Null
 
           $releaseDir = "target\$env:TARGET\release"
-          Copy-Item "$releaseDir\openlogi-gui.exe" stage\OpenLogi.exe
+          Copy-Item "$releaseDir\openlogi-desktop.exe" stage\OpenLogi.exe
           Copy-Item "$releaseDir\openlogi-agent.exe" stage\openlogi-agent.exe
 
           Compress-Archive `
