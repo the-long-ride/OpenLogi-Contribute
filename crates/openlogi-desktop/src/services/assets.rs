@@ -16,7 +16,7 @@
 mod glow;
 mod images;
 mod paths;
-pub(crate) mod scheduler;
+pub(crate) mod queries;
 pub mod sync;
 
 pub(crate) use self::glow::GlowGeometry;
@@ -102,7 +102,7 @@ fn open_in_file_manager(path: &Path) {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedAsset {
     pub depot: String,
     pub display_name: String,
