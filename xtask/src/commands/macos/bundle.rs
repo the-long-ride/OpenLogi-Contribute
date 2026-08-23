@@ -1,9 +1,7 @@
 //! Assembling `OpenLogi.app`: the order the pieces go in, and why.
 
 mod embed;
-mod icns;
 pub(crate) mod identity;
-mod info_plist;
 mod signing;
 
 use std::env;
@@ -13,13 +11,16 @@ use anyhow::{Context as _, Result};
 use strum::VariantArray as _;
 use xshell::{Shell, cmd};
 
+use crate::icon::IconPipeline as _;
+use crate::icon::macos::AppBundle;
 use crate::support::fs::{command_exists, ensure_dir, repo_root};
+use crate::support::info_plist;
+use crate::support::xcode;
 use identity::{Channel, Component};
 
 // The rest of the macOS domain reaches these through `bundle::`, which is the
 // module that owns them conceptually even now that the code sits deeper.
 pub(super) use embed::{HELPERS, Helper};
-pub(crate) use icns::generate_icns;
 pub(super) use signing::quoted_identity;
 
 /// Build `OpenLogi.app` wearing `channel`'s identity, signing it with whatever
@@ -38,10 +39,10 @@ fn run_with_channel(channel: Channel, sign_identity: Option<&str>) -> Result<()>
     let root = repo_root()?;
     let sh = Shell::new()?;
     let _repo = sh.push_dir(&root);
-    let xcode_env = xcode_env()?;
+    let xcode_env = xcode::env()?;
 
     println!("==> app icon");
-    generate_icns()?;
+    AppBundle.compile()?;
 
     if env::var("OPENLOGI_BUNDLE_ASSETS").as_deref() == Ok("1") {
         println!("==> device assets: bundling (offline build)");
@@ -77,6 +78,7 @@ fn run_with_channel(channel: Channel, sign_identity: Option<&str>) -> Result<()>
 
     let app = root.join("target/release/bundle/osx/OpenLogi.app");
     ensure_dir(&app)?;
+    AppBundle.install(&app)?;
     embed::embed_helpers(&root, &app, &xcode_env, channel)?;
     embed::embed_cli(&root, &app, &xcode_env)?;
     embed::verify_bundle_binaries(&app, channel)?;
@@ -86,6 +88,7 @@ fn run_with_channel(channel: Channel, sign_identity: Option<&str>) -> Result<()>
     identity::stamp(&app, channel, Component::VARIANTS)?;
     identity::verify(&app, channel, Component::VARIANTS)?;
     identity::verify_icons(&app, channel, Component::VARIANTS)?;
+    AppBundle.verify(&app)?;
     match (channel, sign_identity) {
         (Channel::Production, Some(identity)) => {
             signing::sign_app_with_timestamp(identity, signing::TimestampMode::Secure, channel)?;
@@ -110,17 +113,4 @@ fn remove_cargo_bundle_dmg(root: &Path) -> Result<()> {
         );
     }
     Ok(())
-}
-
-pub(super) fn xcode_env() -> Result<Vec<(String, String)>> {
-    let sh = Shell::new()?;
-    let developer_dir = env::var("OPENLOGI_DEVELOPER_DIR")
-        .unwrap_or_else(|_| "/Applications/Xcode.app/Contents/Developer".to_string());
-    let sdkroot = cmd!(sh, "/usr/bin/xcrun --sdk macosx --show-sdk-path")
-        .env("DEVELOPER_DIR", &developer_dir)
-        .read()?;
-    Ok(vec![
-        ("DEVELOPER_DIR".to_string(), developer_dir),
-        ("SDKROOT".to_string(), sdkroot.trim().to_string()),
-    ])
 }
