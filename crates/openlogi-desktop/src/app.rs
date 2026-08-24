@@ -1,6 +1,6 @@
 use gpui::{
-    AnyElement, App, AppContext as _, BorrowAppContext as _, Context, Entity, FocusHandle,
-    InteractiveElement, IntoElement, MouseButton, NavigationDirection, ParentElement, Render,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, MouseButton, NavigationDirection, ParentElement, Render,
     StatefulInteractiveElement as _, Styled, Subscription, Window, div,
     prelude::FluentBuilder as _, px, rgb,
 };
@@ -13,7 +13,7 @@ use openlogi_core::device::{Capabilities, DeviceInventory, DeviceKind};
 use openlogi_ipc::InventoryHealth;
 use tracing::info;
 
-use self::menu::{CloseWindow, Minimize, Zoom};
+use self::menu::{APP_KEY_CONTEXT, CloseWindow, Minimize, NavigateBack, Zoom};
 use crate::features::action_ring::ActionRingPanel;
 use crate::features::camera::controls::CameraControlsPanel;
 use crate::features::camera::preview::CameraPreview;
@@ -23,8 +23,9 @@ use crate::features::lighting::standalone::LightPanel;
 use crate::features::mouse::view::MouseModelView;
 use crate::features::pointer::dpi::DpiPanel;
 use crate::features::pointer::smartshift::SmartShiftPanel;
+use crate::features::profile_scope::ProfileIconCache;
 use crate::services::assets::AssetResolver;
-use crate::state::{AgentLink, AppState, DeviceRecord};
+use crate::state::{AgentLink, AppState, DeviceRecord, StateEvent};
 use crate::ui::theme::{self, Palette, Typography as _};
 
 pub(crate) mod deeplink;
@@ -172,14 +173,24 @@ pub struct AppView {
     camera_preview: Entity<CameraPreview>,
     camera_controls: Entity<CameraControlsPanel>,
     light_panel: Entity<LightPanel>,
+    profile_icons: ProfileIconCache,
     appearance_obs: Option<Subscription>,
-    /// Re-renders the root when the device list changes so the empty state
-    /// swaps to the device UI (and back) on hot-plug, without a restart.
-    #[expect(dead_code, reason = "held to keep the AppState observer alive")]
+    /// Invalidates the root only for semantic state changes its current route
+    /// reads; feature entities subscribe to their own events directly.
+    #[expect(dead_code, reason = "held to keep the AppState subscription alive")]
     state_obs: Subscription,
+    /// Whether the last frame was the fail-closed configuration-error screen.
+    /// A successful save must redraw that screen even though the error is gone.
+    config_issue_visible: bool,
     accessibility_dismissed: bool,
     /// Which section of the device-detail screen is showing.
     active_tab: DetailTab,
+}
+
+impl Focusable for AppView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
 }
 
 impl AppView {
@@ -192,11 +203,12 @@ impl AppView {
         let cache = AssetResolver::new();
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
-        // `AppState` is installed as a global by `main` (with the IPC command
-        // sender) before any window opens; downstream reads use `try_global`
-        // and tolerate its absence, so there's no fallback construction here.
+        // `AppState` is installed as an entity by `main` (with the IPC command
+        // sender) before any window opens, so there is no fallback state here.
 
-        if let Some(state) = cx.try_global::<AppState>() {
+        let state = AppState::global(cx);
+        {
+            let state = state.read(cx);
             if let Some(record) = state.current_record() {
                 info!(
                     device_key = %record.config_key,
@@ -211,7 +223,7 @@ impl AppView {
             }
         }
 
-        let mouse_model = cx.new(MouseModelView::new);
+        let mouse_model = cx.new(|cx| MouseModelView::new(window, cx));
         let action_ring_panel = cx.new(ActionRingPanel::new);
         let keyboard_model = cx.new(FunctionRowView::new);
         let dpi_panel = cx.new(DpiPanel::new);
@@ -220,7 +232,48 @@ impl AppView {
         let camera_preview = cx.new(CameraPreview::new);
         let camera_controls = cx.new(CameraControlsPanel::new);
         let light_panel = cx.new(LightPanel::new);
-        let state_obs = cx.observe_global::<AppState>(|_, cx| cx.notify());
+        let state_obs = cx.subscribe(&state, |view, _, event: &StateEvent, cx| {
+            let active_key = AppState::try_read(cx)
+                .and_then(AppState::current_record)
+                .map(DeviceRecord::device_key);
+            let on_home = matches!(view.route, Route::Home);
+            let relevant = match event {
+                StateEvent::AgentChanged
+                | StateEvent::InventoryChanged
+                | StateEvent::DeviceSelected(_) => true,
+                StateEvent::ForegroundChanged => !on_home,
+                StateEvent::BindingsChanged(key) | StateEvent::DpiChanged(key) => {
+                    !on_home
+                        && view.active_tab == DetailTab::Device
+                        && active_key.as_ref() == Some(key)
+                }
+                StateEvent::LightingChanged(key) => {
+                    on_home
+                        || (view.active_tab == DetailTab::Light && active_key.as_ref() == Some(key))
+                }
+                StateEvent::DeviceConfigChanged(key) => {
+                    on_home
+                        || (matches!(view.active_tab, DetailTab::Pointer | DetailTab::Device)
+                            && active_key.as_ref() == Some(key))
+                }
+                StateEvent::CameraChanged => on_home || view.active_tab == DetailTab::Light,
+                // Child entities own these surfaces and subscribe directly.
+                StateEvent::SmartShiftChanged(_)
+                | StateEvent::CameraPermissionChanged
+                | StateEvent::DiagnosticsChanged => false,
+                // App-wide settings render in their own window. The root only
+                // cares when a persistence/reload failure opens or closes its
+                // fail-closed configuration-error screen.
+                StateEvent::SettingsChanged => {
+                    view.config_issue_visible
+                        || AppState::try_read(cx)
+                            .is_some_and(|state| state.config_issue().is_some())
+                }
+            };
+            if relevant {
+                cx.notify();
+            }
+        });
         Self {
             focus_handle,
             route: Route::Home,
@@ -233,8 +286,10 @@ impl AppView {
             camera_preview,
             camera_controls,
             light_panel,
+            profile_icons: ProfileIconCache::default(),
             appearance_obs: None,
             state_obs,
+            config_issue_visible: false,
             accessibility_dismissed: false,
             active_tab: DetailTab::Buttons,
         }
@@ -250,20 +305,27 @@ impl AppView {
     /// selection follow [`AppState::set_current_device`]) and switches the
     /// route to its detail screen.
     fn open_device(&mut self, config_key: String, cx: &mut Context<Self>) {
-        cx.update_global::<AppState, _>(|state, _| {
+        AppState::global(cx).update(cx, |state, cx| {
             if let Some(idx) = state
                 .device_list
                 .iter()
                 .position(|r| r.config_key == config_key)
             {
+                let changed = state.current_device != idx;
                 state.set_current_device(idx);
+                if changed {
+                    cx.emit(StateEvent::DeviceSelected(
+                        state.device_list[idx].device_key(),
+                    ));
+                }
             }
         });
+        AppState::load_current_device_reads(cx);
         self.route = Route::Device { config_key };
         // Land on the device's first relevant tab — Buttons for a mouse,
         // Lighting for a wired keyboard, Device for everything else.
-        self.active_tab = cx
-            .try_global::<AppState>()
+        self.active_tab = AppState::try_global(cx)
+            .map(|state| state.read(cx))
             .and_then(AppState::current_record)
             .map_or(DetailTab::Device, DetailTab::default_for);
         cx.notify();
@@ -279,9 +341,9 @@ impl AppView {
     /// Attach the window-level back-navigation listeners to `root`: a mouse
     /// configurator should honor the hardware it configures. Two routes reach
     /// us — the native navigate button (its default binding never diverts, so
-    /// the OS still sees it), and Alt+Left, which is both what a rebound
-    /// button's BrowserBack action injects on Linux and what keyboard users
-    /// expect.
+    /// the OS still sees it), and the contextual [`NavigateBack`] action, bound
+    /// to Alt+Left (what a rebound BrowserBack action injects on Linux and what
+    /// keyboard users expect).
     fn with_back_navigation(root: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
         root.on_mouse_down(
             MouseButton::Navigate(NavigationDirection::Back),
@@ -291,11 +353,8 @@ impl AppView {
                 }
             }),
         )
-        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-            if event.keystroke.modifiers.alt
-                && event.keystroke.key == "left"
-                && !matches!(this.route, Route::Home)
-            {
+        .on_action(cx.listener(|this, _: &NavigateBack, _, cx| {
+            if !matches!(this.route, Route::Home) {
                 this.go_home(cx);
             }
         }))
@@ -304,7 +363,7 @@ impl AppView {
     fn accessibility_gate(pal: Palette, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
             .size_full()
-            .bg(pal.bg)
+            .bg(pal.page)
             .text_color(pal.text_primary)
             .items_center()
             .justify_center()
@@ -377,8 +436,8 @@ fn request_accessibility(cx: &mut App) {
     // must name and authorize openlogi-agent — prompting in the GUI would grant
     // the wrong binary), then open the System Settings pane so the user can flip
     // the switch. Shared by the gate button, the footer, and the Settings window.
-    if let Some(state) = cx.try_global::<AppState>() {
-        state.request_accessibility_prompt();
+    if let Some(state) = AppState::try_global(cx) {
+        state.read(cx).request_accessibility_prompt();
     }
     permissions::open_pane(Permission::Accessibility);
 }
@@ -415,9 +474,11 @@ impl Render for AppView {
         // first frame on, not only once the full UI is up.
         let root = v_flex()
             .size_full()
-            .bg(pal.bg)
+            .bg(pal.page)
             .text_color(pal.text_primary)
+            .tab_group()
             .track_focus(&self.focus_handle)
+            .key_context(APP_KEY_CONTEXT)
             .on_action(|_: &CloseWindow, window, _| window.remove_window())
             .on_action(|_: &Minimize, window, _| window.minimize_window())
             .on_action(|_: &Zoom, window, _| window.zoom_window())
@@ -430,11 +491,12 @@ impl Render for AppView {
             });
         let root = Self::with_back_navigation(root, cx);
 
-        if let Some(issue) = cx
-            .try_global::<AppState>()
+        let config_issue = AppState::try_global(cx)
+            .map(|state| state.read(cx))
             .and_then(AppState::config_issue)
-            .map(gpui::SharedString::from)
-        {
+            .map(gpui::SharedString::from);
+        self.config_issue_visible = config_issue.is_some();
+        if let Some(issue) = config_issue {
             window.set_window_title("OpenLogi");
             return root
                 .child(status::config_issue_body(issue, pal))
@@ -448,8 +510,8 @@ impl Render for AppView {
         // assumed-denied defaults flashed both screens at every already-set-up
         // user on launch. A missing global reads the same way — "nothing is
         // known yet".
-        let link = cx
-            .try_global::<AppState>()
+        let link = AppState::try_global(cx)
+            .map(|state| state.read(cx))
             .map_or(AgentLink::Connecting, |s| s.agent_link().clone());
         let status = match link {
             AgentLink::Connecting => {
@@ -477,8 +539,8 @@ impl Render for AppView {
                 .into_any_element();
         }
 
-        let has_device = cx
-            .try_global::<AppState>()
+        let has_device = AppState::try_global(cx)
+            .map(|state| state.read(cx))
             .is_some_and(|s| !s.device_list.is_empty());
 
         // Resolve the route. A detail route lives only while its device is
@@ -488,7 +550,8 @@ impl Render for AppView {
         let show_device = match &self.route {
             Route::Home => false,
             Route::Device { config_key } => {
-                cx.try_global::<AppState>()
+                AppState::try_global(cx)
+                    .map(|state| state.read(cx))
                     .and_then(AppState::current_record)
                     .map(|r| r.config_key.as_str())
                     == Some(config_key.as_str())
@@ -501,14 +564,11 @@ impl Render for AppView {
         window.set_window_title(&widgets::main_window_title(show_device, cx));
 
         let (header_el, content_el) = if show_device {
-            // Resolve the active section once and share it between the header
-            // (which renders the section tabs) and the body, so the two can't
-            // disagree about which tab is live. The stored tab may not belong to
-            // this device — it can linger across a hot-plug onto a different kind
-            // — so fall back to the device's first tab for display, without
-            // mutating `active_tab`.
-            let record = cx
-                .try_global::<AppState>()
+            // Resolve the active section once for both the navigation rail and
+            // its workspace. The stored tab may not belong to this device — it
+            // can linger across a hot-plug onto a different kind — so fall back
+            // to the device's first tab without mutating `active_tab`.
+            let record = AppState::try_read(cx)
                 .and_then(AppState::current_record)
                 .cloned();
             let tabs = record
@@ -534,7 +594,7 @@ impl Render for AppView {
             self.camera_preview
                 .update(cx, |preview, cx| preview.set_target(camera_target, cx));
             (
-                detail::detail_header(record.as_ref(), &tabs, active, pal, cx).into_any_element(),
+                detail::detail_header(record.as_ref(), pal, cx).into_any_element(),
                 detail::detail_content(
                     &detail::DetailPanels {
                         mouse_model: &self.mouse_model,
@@ -547,6 +607,8 @@ impl Render for AppView {
                         camera_controls: &self.camera_controls,
                         light_panel: &self.light_panel,
                     },
+                    &mut self.profile_icons,
+                    &tabs,
                     active,
                     pal,
                     cx,
@@ -572,7 +634,7 @@ impl Render for AppView {
 
         root.child(header_el)
             .child(content_el)
-            .child(status::footer(pal, granted))
+            .when(!granted, |this| this.child(status::attention_footer(pal)))
             .into_any_element()
     }
 }
