@@ -17,6 +17,7 @@ use gpui_component::{
 };
 use openlogi_core::config::ScrollResolution;
 use openlogi_core::device::{BatteryStatus, DeviceKind};
+use openlogi_core::hid::DeviceRoute;
 
 use super::widgets::{
     back_button, battery_charging_no_reading, battery_summary, kind_label, route_label,
@@ -34,7 +35,7 @@ use crate::features::lighting::visual as light_visual;
 use crate::features::mouse::view::MouseModelView;
 use crate::features::pointer::dpi::DpiPanel;
 use crate::features::pointer::smartshift::SmartShiftPanel;
-use crate::features::profile_scope::{ProfileIconCache, profile_scope_bar};
+use crate::features::profile_scope::{AppCatalogPicker, ProfileIconCache, profile_scope_bar};
 use crate::state::{AppState, DeviceRecord, StateEvent};
 use crate::ui::components::{PanelCard, Toggle};
 use crate::ui::theme::{
@@ -125,7 +126,8 @@ pub(super) struct DetailPanels<'a> {
 /// device's tab set.
 pub(super) fn detail_content(
     panels: &DetailPanels<'_>,
-    profile_icons: &mut ProfileIconCache,
+    profile_icons: &ProfileIconCache,
+    app_catalog: &gpui::Entity<AppCatalogPicker>,
     tabs: &[DetailTab],
     active: DetailTab,
     pal: Palette,
@@ -136,7 +138,7 @@ pub(super) fn detail_content(
         .is_some_and(|record| record.online);
     let content = match active {
         DetailTab::Buttons => {
-            buttons_tab(panels.mouse_model, profile_icons, pal, cx).into_any_element()
+            buttons_tab(panels.mouse_model, profile_icons, app_catalog, pal, cx).into_any_element()
         }
         DetailTab::ActionsRing => action_ring_tab(panels.action_ring).into_any_element(),
         DetailTab::Keys => keys_tab(panels.keyboard_model).into_any_element(),
@@ -271,7 +273,8 @@ fn detail_tab_icon(tab: DetailTab) -> &'static str {
 /// binding inspector.
 fn buttons_tab(
     mouse_model: &gpui::Entity<MouseModelView>,
-    profile_icons: &mut ProfileIconCache,
+    profile_icons: &ProfileIconCache,
+    app_catalog: &gpui::Entity<AppCatalogPicker>,
     pal: Palette,
     cx: &mut Context<AppView>,
 ) -> impl IntoElement {
@@ -279,7 +282,7 @@ fn buttons_tab(
         .flex_1()
         .w_full()
         .min_h_0()
-        .children(profile_scope_bar(pal, profile_icons, cx))
+        .children(profile_scope_bar(pal, profile_icons, app_catalog, cx))
         .child(mouse_model.clone())
 }
 
@@ -625,6 +628,7 @@ fn device_details_card(pal: Palette, cx: &mut Context<AppView>) -> impl IntoElem
                     .gap_3()
                     .child(device_summary(
                         &record.display_name,
+                        &record.model_name,
                         record.kind,
                         record.online,
                         pal,
@@ -653,7 +657,7 @@ fn configuration_card(pal: Palette, cx: &mut Context<AppView>) -> impl IntoEleme
             || (0, 0, 0, tr!("Default profile").to_string()),
             |state| {
                 (
-                    state.button_bindings.len(),
+                    state.button_bindings().len(),
                     // Device-level, not scope-level: this card describes the
                     // device, and a per-app profile holds no gestures at all.
                     state.device_gesture_binding_count(),
@@ -737,7 +741,18 @@ fn configuration_card(pal: Palette, cx: &mut Context<AppView>) -> impl IntoEleme
     PanelCard::new(tr!("Configuration"), Icon::new(IconName::Folder), content)
 }
 
-fn device_summary(name: &str, kind: DeviceKind, online: bool, pal: Palette) -> impl IntoElement {
+fn device_summary(
+    name: &str,
+    model_name: &str,
+    kind: DeviceKind,
+    online: bool,
+    pal: Palette,
+) -> impl IntoElement {
+    let subtitle = if name == model_name {
+        kind_label(kind)
+    } else {
+        format!("{model_name} · {}", kind_label(kind))
+    };
     h_flex()
         .justify_between()
         .gap_3()
@@ -751,7 +766,7 @@ fn device_summary(name: &str, kind: DeviceKind, online: bool, pal: Palette) -> i
                     div()
                         .text_caption()
                         .text_color(pal.text_muted)
-                        .child(kind_label(kind)),
+                        .child(subtitle),
                 ),
         )
         .child(status_badge(online, pal))
@@ -767,8 +782,11 @@ fn device_description_list(record: DeviceRecord) -> impl IntoElement {
         route_label(record.route.as_ref())
     };
     let mut items = vec![DescriptionItem::new(tr!("Connection")).value(connection)];
-    if !is_camera {
-        items.push(DescriptionItem::new(tr!("Slot")).value(record.slot.to_string()));
+    if matches!(
+        record.route,
+        Some(DeviceRoute::Bolt { .. } | DeviceRoute::Unifying { .. })
+    ) {
+        items.push(DescriptionItem::new(tr!("Channel")).value(record.slot.to_string()));
     }
     items.push(DescriptionItem::new(tr!("Device key")).value(elided_key(&record.config_key)));
     if let Some(serial) = record.serial_number {

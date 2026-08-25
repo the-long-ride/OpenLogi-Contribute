@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use openlogi_camera::Camera;
 use openlogi_core::binding::{Action, Binding, ButtonId};
 use openlogi_core::config::{
     Config, DeviceIdentity, LightSettings, Lighting, ScrollResolution, ThumbwheelSensitivity,
@@ -106,7 +107,7 @@ fn direct_inventory(unit_id: [u8; 4]) -> DeviceInventory {
     }
 }
 
-/// A second, unmistakably different mouse, so a test can move the carousel.
+/// A second, unmistakably different mouse, so a test can change the active device.
 fn second_mouse_inventory() -> DeviceInventory {
     let mut inventory = direct_inventory([0x11, 0x22, 0x33, 0x44]);
     inventory.receiver.name = "MX Anywhere 3S".to_string();
@@ -216,6 +217,108 @@ fn state_with_a_known_mouse() -> AppState {
     )
 }
 
+const CAMERA_A_ID: &str = "0x1123000046d0893";
+const CAMERA_B_ID: &str = "0x14110000046d0893";
+
+fn serial_less_same_model_cameras() -> [Camera; 2] {
+    let first = Camera {
+        name: "Logitech StreamCam".to_string(),
+        unique_id: CAMERA_A_ID.to_string(),
+        serial_number: None,
+        vendor_id: 0x046d,
+        product_id: 0x0893,
+        max_resolution: None,
+        max_fps: None,
+    };
+    let second = Camera {
+        unique_id: CAMERA_B_ID.to_string(),
+        ..first.clone()
+    };
+    [first, second]
+}
+
+fn state_with_same_model_cameras(config: Config) -> AppState {
+    let cameras = serial_less_same_model_cameras();
+    let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    AppState::with_runtime(
+        config,
+        &[],
+        &[],
+        &AssetResolver::new(),
+        &cameras,
+        ConfigPersistence::MemoryOnly,
+        commands,
+    )
+}
+
+fn camera_record<'a>(state: &'a AppState, capture_id: &str) -> &'a super::DeviceRecord {
+    state
+        .devices()
+        .iter()
+        .find(|record| record.capture_id.as_deref() == Some(capture_id))
+        .expect("camera record")
+}
+
+#[test]
+fn custom_device_name_updates_the_ui_and_can_restore_the_model_name() {
+    let mut state = state_with_a_known_mouse();
+    let model_name = state
+        .current_record()
+        .expect("known mouse")
+        .model_name
+        .clone();
+
+    state.set_device_custom_name(KNOWN_MOUSE_KEY, "  Office mouse  ");
+
+    assert_eq!(
+        state
+            .current_record()
+            .map(|record| record.display_name.as_str()),
+        Some("Office mouse")
+    );
+    assert_eq!(
+        state.config.device_custom_name(KNOWN_MOUSE_KEY),
+        Some("Office mouse")
+    );
+
+    state.set_device_custom_name(KNOWN_MOUSE_KEY, "   ");
+
+    assert_eq!(
+        state
+            .current_record()
+            .map(|record| record.display_name.as_str()),
+        Some(model_name.as_str())
+    );
+    assert_eq!(state.config.device_custom_name(KNOWN_MOUSE_KEY), None);
+}
+
+#[test]
+fn same_model_serial_less_cameras_keep_independent_names() {
+    let mut state = state_with_same_model_cameras(Config::ephemeral());
+    let second_key = camera_record(&state, CAMERA_B_ID).record_key();
+
+    state.set_device_custom_name(&second_key, "Desk camera");
+
+    assert_eq!(
+        camera_record(&state, CAMERA_A_ID).display_name,
+        "Logitech StreamCam"
+    );
+    assert_eq!(
+        camera_record(&state, CAMERA_B_ID).display_name,
+        "Desk camera"
+    );
+
+    let restored = state_with_same_model_cameras(state.config.clone());
+    assert_eq!(
+        camera_record(&restored, CAMERA_A_ID).display_name,
+        "Logitech StreamCam"
+    );
+    assert_eq!(
+        camera_record(&restored, CAMERA_B_ID).display_name,
+        "Desk camera"
+    );
+}
+
 fn app(id: &str, display_name: &str) -> ForegroundApp {
     ForegroundApp {
         id: id.to_string(),
@@ -255,14 +358,14 @@ fn clearing_an_override_falls_back_to_the_global_binding() {
     state.set_editing_app(Some("com.apple.Safari".into()));
     state.commit_binding(ButtonId::Back, Action::Undo);
     assert_eq!(
-        state.button_bindings.get(&ButtonId::Back),
+        state.button_bindings().get(&ButtonId::Back),
         Some(&Action::Undo)
     );
 
     state.clear_app_binding(ButtonId::Back);
 
     assert_eq!(
-        state.button_bindings.get(&ButtonId::Back),
+        state.button_bindings().get(&ButtonId::Back),
         Some(&Action::Copy),
         "the panel falls back to what the default profile binds"
     );
@@ -285,11 +388,11 @@ fn clearing_a_thumbwheel_override_drops_both_directions() {
     state.clear_app_thumbwheel();
 
     assert_eq!(
-        state.button_bindings.get(&ButtonId::ThumbwheelScrollDown),
+        state.button_bindings().get(&ButtonId::ThumbwheelScrollDown),
         Some(&Action::VolumeDown)
     );
     assert_eq!(
-        state.button_bindings.get(&ButtonId::ThumbwheelScrollUp),
+        state.button_bindings().get(&ButtonId::ThumbwheelScrollUp),
         Some(&Action::VolumeUp)
     );
     assert!(
@@ -333,7 +436,8 @@ fn a_gesture_button_stays_one_when_the_scope_returns_to_the_default_profile() {
     state.set_editing_app(Some("com.apple.Safari".into()));
     assert!(state.current_gesture_maps().is_empty());
     assert_eq!(
-        state.gesture_bindings, global,
+        state.gesture_bindings(),
+        &global,
         "the inspector cache keeps inherited gestures while per-app editing hides their controls"
     );
     // The device still has its gestures — only the open profile cannot show
@@ -349,7 +453,7 @@ fn a_gesture_button_stays_one_when_the_scope_returns_to_the_default_profile() {
 
 #[test]
 fn a_profile_belongs_to_the_device_it_was_opened_on() {
-    // Overlays are per-device, so a scope must not follow the carousel onto
+    // Overlays are per-device, so a scope must not follow the selection onto
     // another mouse and silently edit a profile the user never opened.
     let cache = AssetResolver::new();
     let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -366,12 +470,12 @@ fn a_profile_belongs_to_the_device_it_was_opened_on() {
         commands,
     );
     let other = state
-        .device_list
+        .devices()
         .iter()
         .position(|record| record.config_key != KNOWN_MOUSE_KEY)
         .expect("the fixture pairs a second device");
     let known = state
-        .device_list
+        .devices()
         .iter()
         .position(|record| record.config_key == KNOWN_MOUSE_KEY)
         .expect("the fixture pairs the known mouse");
@@ -395,6 +499,16 @@ fn a_profile_belongs_to_the_device_it_was_opened_on() {
 }
 
 #[test]
+fn invalid_device_selection_preserves_the_valid_current_device() {
+    let mut state = state_with_a_known_mouse();
+    let selected = state.selected_device_index();
+
+    assert_eq!(state.set_current_device(usize::MAX), None);
+    assert_eq!(state.selected_device_index(), selected);
+    assert!(state.current_record().is_some());
+}
+
+#[test]
 fn the_active_profile_is_the_default_until_the_app_in_front_is_overridden() {
     let mut state = state_with_a_known_mouse();
     let safari = app("com.apple.Safari", "Safari");
@@ -409,12 +523,14 @@ fn the_active_profile_is_the_default_until_the_app_in_front_is_overridden() {
         "an app with no overrides runs the device's global bindings"
     );
 
-    state.config.set_per_app_binding(
-        KNOWN_MOUSE_KEY,
-        "com.apple.Safari",
-        ButtonId::Back,
-        Some(Action::Undo),
-    );
+    state.config.edit(|config| {
+        config.set_per_app_binding(
+            KNOWN_MOUSE_KEY,
+            "com.apple.Safari",
+            ButtonId::Back,
+            Some(Action::Undo),
+        );
+    });
     assert_eq!(state.active_profile_name(), Some("Safari"));
 }
 
@@ -426,12 +542,14 @@ fn the_profile_shown_is_the_apps_even_while_this_window_has_focus() {
     // at all before). The recent list excludes our own windows, so its head is
     // the app the user came from.
     let mut state = state_with_a_known_mouse();
-    state.config.set_per_app_binding(
-        KNOWN_MOUSE_KEY,
-        "com.apple.Safari",
-        ButtonId::Back,
-        Some(Action::Undo),
-    );
+    state.config.edit(|config| {
+        config.set_per_app_binding(
+            KNOWN_MOUSE_KEY,
+            "com.apple.Safari",
+            ButtonId::Back,
+            Some(Action::Undo),
+        );
+    });
     state.set_foreground(ForegroundApps {
         current: Some(app(openlogi_core::brand::APP_ID, "OpenLogi")),
         recent: vec![app("com.apple.Safari", "Safari")],
@@ -443,12 +561,14 @@ fn the_profile_shown_is_the_apps_even_while_this_window_has_focus() {
 #[test]
 fn a_host_with_no_readable_foreground_app_reports_the_default_profile() {
     let mut state = state_with_a_known_mouse();
-    state.config.set_per_app_binding(
-        KNOWN_MOUSE_KEY,
-        "com.apple.Safari",
-        ButtonId::Back,
-        Some(Action::Undo),
-    );
+    state.config.edit(|config| {
+        config.set_per_app_binding(
+            KNOWN_MOUSE_KEY,
+            "com.apple.Safari",
+            ButtonId::Back,
+            Some(Action::Undo),
+        );
+    });
     // A pure-Wayland session with no usable backend, or a watcher that could
     // not start: the agent reports nothing and no profile can be in effect.
     assert!(!state.set_foreground(ForegroundApps::default()));
@@ -471,7 +591,7 @@ fn transient_identity_is_not_persisted_or_retained_after_resolution() {
     );
     let transient_key = "direct:046d:b023:unit:00000000";
 
-    assert_eq!(state.device_list.len(), 1);
+    assert_eq!(state.devices().len(), 1);
     assert!(state.config.device_identity(transient_key).is_none());
     state.commit_dpi(Dpi::new(2400));
     assert!(state.config.dpi(transient_key).is_none());
@@ -507,7 +627,7 @@ fn transient_probe_folds_into_its_known_card() {
         commands,
     );
     let stable_key = "direct:046d:b023:unit:a393cae0";
-    assert_eq!(state.device_list[0].config_key, stable_key);
+    assert_eq!(state.devices()[0].config_key, stable_key);
 
     let transient_list =
         build_device_list(&[direct_inventory([0; 4])], &[], &cache, &state.config, &[]);
@@ -616,7 +736,7 @@ fn ambiguous_transient_probe_is_not_adopted() {
         ConfigPersistence::MemoryOnly,
         commands,
     );
-    assert_eq!(state.device_list.len(), 2);
+    assert_eq!(state.devices().len(), 2);
 
     let transient_list =
         build_device_list(&[direct_inventory([0; 4])], &[], &cache, &state.config, &[]);
@@ -647,7 +767,7 @@ fn historical_transient_lighting_is_not_exposed_without_a_live_record() {
         commands,
     );
 
-    assert!(state.device_list.is_empty());
+    assert!(state.devices().is_empty());
     assert!(state.lighting_for(transient_key).is_none());
 }
 
@@ -1146,16 +1266,18 @@ fn camera_automation_preserves_manual_power_and_clears_transient_override() {
         .expect("light record")
         .config_key
         .clone();
-    state.config.set_light(
-        &key,
-        LightSettings {
-            enabled: false,
-            auto_camera: true,
-            brightness_percent: 70,
-            temperature_kelvin: None,
-            color: None,
-        },
-    );
+    state.config.edit(|config| {
+        config.set_light(
+            &key,
+            LightSettings {
+                enabled: false,
+                auto_camera: true,
+                brightness_percent: 70,
+                temperature_kelvin: None,
+                color: None,
+            },
+        );
+    });
 
     assert!(!state.light_enabled());
     assert!(state.set_camera_active(true));
@@ -1303,7 +1425,7 @@ fn a_battery_only_change_reaches_the_device_list() {
         commands,
     );
     assert_eq!(
-        state.device_list[0].battery.as_ref().map(|b| b.percentage),
+        state.devices()[0].battery.as_ref().map(|b| b.percentage),
         Some(50)
     );
 
@@ -1312,7 +1434,7 @@ fn a_battery_only_change_reaches_the_device_list() {
 
     assert!(changed, "a battery change is a change");
     assert_eq!(
-        state.device_list[0].battery.as_ref().map(|b| b.percentage),
+        state.devices()[0].battery.as_ref().map(|b| b.percentage),
         Some(40),
         "the fresh reading must replace the stale one"
     );

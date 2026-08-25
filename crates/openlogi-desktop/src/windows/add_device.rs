@@ -16,9 +16,10 @@
 
 use gpui::{
     App, Context, FocusHandle, FontWeight, Global, InteractiveElement, IntoElement,
-    ParentElement as _, Render, SharedString, Size, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Window, div, prelude::FluentBuilder as _, px,
+    ParentElement as _, Render, SharedString, Size, Styled as _, Subscription, Window, div,
+    prelude::FluentBuilder as _, px,
 };
+use gpui_base::Button as BaseButton;
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     v_flex,
@@ -245,8 +246,8 @@ fn body(state: &PairingUi, pal: Palette) -> impl IntoElement {
                 col = col.child(hint(tr!("No devices found yet…"), pal));
             } else {
                 col = col.child(hint(tr!("Select a device to pair:"), pal));
-                for (idx, device) in devices.iter().enumerate() {
-                    col = col.child(device_row(idx, device, pal));
+                for device in devices {
+                    col = col.child(device_row(device, pal));
                 }
             }
             col = col.child(cancel_button());
@@ -310,10 +311,14 @@ fn body(state: &PairingUi, pal: Palette) -> impl IntoElement {
 }
 
 /// A discovered-device row; clicking it pairs with that device.
-fn device_row(idx: usize, device: &FoundDevice, pal: Palette) -> impl IntoElement {
+fn device_row(device: &FoundDevice, pal: Palette) -> impl IntoElement {
     let address = device.address;
-    div()
-        .id(("found-device", idx))
+    let address_id = u64::from_be_bytes([
+        0, 0, address[0], address[1], address[2], address[3], address[4], address[5],
+    ]);
+    let name = SharedString::from(device.name.clone());
+    BaseButton::new(("found-device", address_id))
+        .accessibility_label(name.clone())
         .w_full()
         .px_4()
         .py_3()
@@ -323,11 +328,8 @@ fn device_row(idx: usize, device: &FoundDevice, pal: Palette) -> impl IntoElemen
         .cursor_pointer()
         .bg(pal.control)
         .hover(|s| s.bg(pal.control_hover))
-        .child(
-            div()
-                .text_body()
-                .child(SharedString::from(device.name.clone())),
-        )
+        .focus_visible(|s| s.bg(pal.control_hover))
+        .child(div().text_body().child(name))
         .on_click(move |_, _, cx| send(cx, Command::PairDevice(address)))
 }
 

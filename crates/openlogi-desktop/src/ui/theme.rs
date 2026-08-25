@@ -44,6 +44,8 @@ const BASE_REM_SIZE: f32 = 16.;
 /// Maximum-width scale for detail-tab content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContentWidth {
+    /// Compact explanatory copy and empty-state text (440 px at 100%).
+    Narrow,
     /// A single compact settings card (560 px at 100%).
     Small,
     /// A wider single panel (680 px at 100%).
@@ -61,6 +63,7 @@ impl ContentWidth {
     #[must_use]
     pub const fn rems(self) -> Rems {
         match self {
+            Self::Narrow => rems(27.5),
             Self::Small => rems(35.),
             Self::Medium => rems(42.5),
             Self::Large => rems(57.5),
@@ -85,12 +88,14 @@ pub const CARD_GAP: Rems = rems(0.75);
 /// Apple HIG / WCAG minimum contrast for normal text up to 17pt.
 const MIN_TEXT_CONTRAST: f32 = 4.5;
 
-/// Fixed footprint of a device card in the Home gallery. Equal-width cards lay
-/// out in a horizontally scrollable row (centred when they fit, scrollable when
-/// they don't); `GALLERY_PHOTO_H` is the height of the device photo above the
-/// name/battery row.
-pub const GALLERY_CARD_W: f32 = 240.;
-pub const GALLERY_PHOTO_H: f32 = 230.;
+/// Responsive bounds for a device card in the Home grid. At standard scale,
+/// two cards fit the 720 px minimum window after the screen inset and gap; at
+/// the normal wide window, three grow to [`GALLERY_CARD_MAX_W`].
+/// `GALLERY_PHOTO_H` is the fixed product-image stage above the scalable
+/// identity and status rows.
+pub const GALLERY_CARD_MIN_W: Rems = rems(19.375);
+pub const GALLERY_CARD_MAX_W: Rems = rems(25.3125);
+pub const GALLERY_PHOTO_H: f32 = 196.;
 
 /// Appearance-dependent surface + text colours for the bespoke (non
 /// gpui-component) surfaces. Resolved once per render via [`palette`] and
@@ -252,6 +257,11 @@ fn rem_size(scale: UiScale) -> Pixels {
     px(BASE_REM_SIZE * f32::from(scale.percent()) / 100.)
 }
 
+/// Apply one semantic interface scale to a window.
+pub(crate) fn apply_scale(window: &mut Window, scale: UiScale) {
+    window.set_rem_size(rem_size(scale));
+}
+
 /// Apply the stored interface scale to one desktop window.
 ///
 /// Root views call this before building their elements so text and every
@@ -260,7 +270,7 @@ fn rem_size(scale: UiScale) -> Pixels {
 pub fn apply_ui_scale(window: &mut Window, cx: &App) {
     let scale =
         AppState::try_read(cx).map_or_else(UiScale::default, |state| state.app_settings().ui_scale);
-    window.set_rem_size(rem_size(scale));
+    apply_scale(window, scale);
 }
 
 /// Resolve the user's stored appearance preference and apply it to the global
@@ -450,6 +460,7 @@ mod tests {
     fn content_width_scale_preserves_the_standard_layout() {
         assert_eq!(
             [
+                ContentWidth::Narrow,
                 ContentWidth::Small,
                 ContentWidth::Medium,
                 ContentWidth::Large,
@@ -457,7 +468,7 @@ mod tests {
                 ContentWidth::DoubleExtraLarge,
             ]
             .map(|width| width.rems().to_pixels(px(BASE_REM_SIZE))),
-            [px(560.), px(680.), px(920.), px(980.), px(1040.)]
+            [px(440.), px(560.), px(680.), px(920.), px(980.), px(1040.),]
         );
     }
 

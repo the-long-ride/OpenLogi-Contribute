@@ -1,9 +1,9 @@
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, MouseButton, NavigationDirection, ParentElement, Render,
-    StatefulInteractiveElement as _, Styled, Subscription, Window, div,
-    prelude::FluentBuilder as _, px, rgb,
+    IntoElement, MouseButton, NavigationDirection, ParentElement, Render, Styled, Subscription,
+    Window, div, prelude::FluentBuilder as _, rgb,
 };
+use gpui_base::Button as BaseButton;
 use gpui_component::{
     Icon, IconName, TitleBar,
     button::{Button, ButtonVariants as _},
@@ -23,10 +23,10 @@ use crate::features::lighting::standalone::LightPanel;
 use crate::features::mouse::view::MouseModelView;
 use crate::features::pointer::dpi::DpiPanel;
 use crate::features::pointer::smartshift::SmartShiftPanel;
-use crate::features::profile_scope::ProfileIconCache;
+use crate::features::profile_scope::{AppCatalogPicker, ProfileIconCache};
 use crate::services::assets::AssetResolver;
 use crate::state::{AgentLink, AppState, DeviceRecord, StateEvent};
-use crate::ui::theme::{self, Palette, Typography as _};
+use crate::ui::theme::{self, ContentWidth, Palette, Typography as _};
 
 pub(crate) mod deeplink;
 mod detail;
@@ -48,17 +48,18 @@ pub(crate) use widgets::battery_charging_no_reading;
 /// which subtree [`AppView::render`] builds. It is deliberately *not* in
 /// [`AppState`]: the route is pure UI presentation, whereas
 /// [`AppState::current_device`] is functional (it drives the hook bindings,
-/// DPI, and persisted selection). The detail route is keyed by `config_key`
-/// rather than an index so a hot-plug that reorders or drops the device list
-/// can't silently swap the user onto a different device's settings — render
-/// validates the key against the live selection and pops back to [`Route::Home`]
-/// when it no longer matches.
+/// DPI, and persisted selection). The detail route is keyed by the record's
+/// user-facing identity rather than an index so a hot-plug that reorders
+/// or drops the device list can't silently swap the user onto another device —
+/// including a same-model camera that shares its settings key. Render validates
+/// the key against the live selection and pops back to [`Route::Home`] when it
+/// no longer matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Route {
     /// The device gallery.
     Home,
-    /// A single device's settings, identified by its stable config key.
-    Device { config_key: String },
+    /// A single device's settings, identified by its user-facing record key.
+    Device { record_key: String },
 }
 
 /// The active section of the device-detail screen. Backs the detail `TabBar`;
@@ -174,6 +175,9 @@ pub struct AppView {
     camera_controls: Entity<CameraControlsPanel>,
     light_panel: Entity<LightPanel>,
     profile_icons: ProfileIconCache,
+    app_catalog: Entity<AppCatalogPicker>,
+    /// Redraw the profile picker after discovery, filtering, or expansion changes.
+    _app_catalog_obs: Subscription,
     appearance_obs: Option<Subscription>,
     /// Invalidates the root only for semantic state changes its current route
     /// reads; feature entities subscribe to their own events directly.
@@ -232,6 +236,8 @@ impl AppView {
         let camera_preview = cx.new(CameraPreview::new);
         let camera_controls = cx.new(CameraControlsPanel::new);
         let light_panel = cx.new(LightPanel::new);
+        let app_catalog = cx.new(|cx| AppCatalogPicker::new(window, cx));
+        let app_catalog_obs = cx.observe(&app_catalog, |_, _, cx| cx.notify());
         let state_obs = cx.subscribe(&state, |view, _, event: &StateEvent, cx| {
             let active_key = AppState::try_read(cx)
                 .and_then(AppState::current_record)
@@ -287,6 +293,8 @@ impl AppView {
             camera_controls,
             light_panel,
             profile_icons: ProfileIconCache::default(),
+            app_catalog,
+            _app_catalog_obs: app_catalog_obs,
             appearance_obs: None,
             state_obs,
             config_issue_visible: false,
@@ -304,24 +312,19 @@ impl AppView {
     /// functionally active device too (hook bindings, DPI, and the persisted
     /// selection follow [`AppState::set_current_device`]) and switches the
     /// route to its detail screen.
-    fn open_device(&mut self, config_key: String, cx: &mut Context<Self>) {
+    fn open_device(&mut self, record_key: String, cx: &mut Context<Self>) {
         AppState::global(cx).update(cx, |state, cx| {
             if let Some(idx) = state
-                .device_list
+                .devices()
                 .iter()
-                .position(|r| r.config_key == config_key)
+                .position(|record| record.record_key() == record_key)
+                && let Some(key) = state.set_current_device(idx)
             {
-                let changed = state.current_device != idx;
-                state.set_current_device(idx);
-                if changed {
-                    cx.emit(StateEvent::DeviceSelected(
-                        state.device_list[idx].device_key(),
-                    ));
-                }
+                cx.emit(StateEvent::DeviceSelected(key));
             }
         });
         AppState::load_current_device_reads(cx);
-        self.route = Route::Device { config_key };
+        self.route = Route::Device { record_key };
         // Land on the device's first relevant tab — Buttons for a mouse,
         // Lighting for a wired keyboard, Device for everything else.
         self.active_tab = AppState::try_global(cx)
@@ -381,7 +384,7 @@ impl AppView {
             )
             .child(
                 div()
-                    .max_w(px(440.))
+                    .max_w(ContentWidth::Narrow.rems())
                     .text_body()
                     .text_color(pal.text_muted)
                     .child(tr!(
@@ -393,7 +396,7 @@ impl AppView {
             )
             .child(
                 div()
-                    .max_w(px(440.))
+                    .max_w(ContentWidth::Narrow.rems())
                     .text_body()
                     .text_color(pal.text_muted)
                     .child(tr!(
@@ -414,12 +417,13 @@ impl AppView {
                 "Takes effect automatically once granted — no restart needed."
             )))
             .child(
-                div()
-                    .id("skip-accessibility")
+                BaseButton::new("skip-accessibility")
+                    .accessibility_label(tr!("Not now (use DPI and other features only)"))
                     .text_caption()
                     .text_color(pal.text_muted)
                     .cursor_pointer()
                     .hover(|s| s.text_color(pal.text_primary))
+                    .focus_visible(|s| s.text_color(pal.text_primary))
                     .child(tr!("Not now (use DPI and other features only)"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.accessibility_dismissed = true;
@@ -542,7 +546,7 @@ impl Render for AppView {
 
         let has_device = AppState::try_global(cx)
             .map(|state| state.read(cx))
-            .is_some_and(|s| !s.device_list.is_empty());
+            .is_some_and(|s| !s.devices().is_empty());
 
         // Resolve the route. A detail route lives only while its device is
         // still the live selection; if a hot-plug dropped or reordered it (or
@@ -550,13 +554,10 @@ impl Render for AppView {
         // gallery rather than render a different device under the same screen.
         let show_device = match &self.route {
             Route::Home => false,
-            Route::Device { config_key } => {
-                AppState::try_global(cx)
-                    .map(|state| state.read(cx))
-                    .and_then(AppState::current_record)
-                    .map(|r| r.config_key.as_str())
-                    == Some(config_key.as_str())
-            }
+            Route::Device { record_key } => AppState::try_global(cx)
+                .map(|state| state.read(cx))
+                .and_then(AppState::current_record)
+                .is_some_and(|record| record.record_key() == *record_key),
         };
         if !show_device {
             self.route = Route::Home;
@@ -608,7 +609,8 @@ impl Render for AppView {
                         camera_controls: &self.camera_controls,
                         light_panel: &self.light_panel,
                     },
-                    &mut self.profile_icons,
+                    &self.profile_icons,
+                    &self.app_catalog,
                     &tabs,
                     active,
                     pal,
@@ -620,7 +622,7 @@ impl Render for AppView {
             self.camera_preview
                 .update(cx, |preview, cx| preview.set_target(None, cx));
             (
-                home::home_header(pal).into_any_element(),
+                home::home_header(pal, cx).into_any_element(),
                 if has_device {
                     home::device_gallery(cx).into_any_element()
                 } else {
@@ -642,7 +644,7 @@ impl Render for AppView {
 
 #[cfg(test)]
 mod tests {
-    use super::home::connection_icon_path;
+    use super::home::{battery_needs_attention, connection_icon_path, ordered_device_indices};
     use super::{Capabilities, DetailTab, DeviceKind, DeviceRecord, battery_charging_no_reading};
     use openlogi_core::device::{
         BatteryInfo, BatteryLevel, BatteryStatus, DeviceTransports, LightCapabilities,
@@ -672,6 +674,28 @@ mod tests {
         assert!(!battery_charging_no_reading(&b(
             0,
             BatteryStatus::Discharging
+        )));
+    }
+
+    #[test]
+    fn low_discharging_battery_needs_attention() {
+        let battery = |percentage, status| BatteryInfo {
+            percentage,
+            level: BatteryLevel::Low,
+            status,
+        };
+
+        assert!(battery_needs_attention(&battery(
+            20,
+            BatteryStatus::Discharging
+        )));
+        assert!(!battery_needs_attention(&battery(
+            21,
+            BatteryStatus::Discharging
+        )));
+        assert!(!battery_needs_attention(&battery(
+            20,
+            BatteryStatus::Charging
         )));
     }
 
@@ -758,6 +782,7 @@ mod tests {
             config_key: "test".to_string(),
             persistent: true,
             model_key: "test".to_string(),
+            model_name: "Test".to_string(),
             display_name: "Test".to_string(),
             asset: None,
             model_info: None,
@@ -775,6 +800,20 @@ mod tests {
             online: true,
             battery: None,
         }
+    }
+
+    #[test]
+    fn gallery_order_moves_connected_devices_first_stably() {
+        let mut records = vec![
+            record(DeviceKind::Mouse, None),
+            record(DeviceKind::Keyboard, None),
+            record(DeviceKind::Trackball, None),
+            record(DeviceKind::Light, None),
+        ];
+        records[0].online = false;
+        records[2].online = false;
+
+        assert_eq!(ordered_device_indices(&records), vec![1, 3, 0, 2]);
     }
 
     /// Tabs follow measured capabilities, not kind — the core of the #127 fix.

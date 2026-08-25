@@ -1,9 +1,7 @@
 //! Permissions settings page (macOS / Linux).
 
 #[cfg(target_os = "macos")]
-use super::{
-    AnyElement, App, AppState, InteractiveElement, Permission, StatefulInteractiveElement,
-};
+use super::{AnyElement, App, AppState, InteractiveElement, Permission};
 use super::{IconName, Palette, SettingPage};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use super::{
@@ -11,6 +9,8 @@ use super::{
     SharedString, Styled, div, h_flex, px, rgb, theme,
 };
 use crate::ui::theme::Typography as _;
+#[cfg(target_os = "macos")]
+use gpui_base::Button as BaseButton;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use openlogi_permissions as permissions;
 
@@ -225,8 +225,8 @@ fn permission_field(
         .gap_3()
         .child(status_el)
         .child(
-            div()
-                .id(id)
+            BaseButton::new(id)
+                .accessibility_label(action_label.clone())
                 .px_2()
                 .py_1()
                 .rounded(pal.control_radius)
@@ -236,6 +236,7 @@ fn permission_field(
                 .cursor_pointer()
                 .bg(pal.control)
                 .hover(move |s| s.bg(pal.control_hover))
+                .focus_visible(move |s| s.bg(pal.control_hover))
                 .child(action_label)
                 .on_click(move |_, _, cx| {
                     // Accessibility must be prompted in the agent (it owns the
