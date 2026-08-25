@@ -20,6 +20,8 @@ use openlogi_core::config::{Appearance, UiScale};
 
 use crate::state::AppState;
 
+use super::spacing::DynamicSpacing;
+
 // The brand accent lives in `openlogi-ui` so the overlay paints the same blue
 // this app does — it cannot depend on this crate, and a local copy is how the
 // ring ended up with a blue of its own. Re-exported so screens keep reading it
@@ -38,6 +40,12 @@ pub const STATUS_DISABLED: u32 = 0x00ef_4444;
 pub const HEADER_H: f32 = 64.;
 pub const FOOTER_H: f32 = 40.;
 pub const DETAIL_RAIL_W: f32 = 168.;
+/// Height of standalone form controls: buttons, text inputs, tabs.
+/// gpui-component's `.small()` maps to a 24 px `h_6`, which reads undersized
+/// against this 30 px control rhythm — small controls pin the height
+/// explicitly (single-line `Input`s via `min_h`; their inherent `h` is
+/// multi-line-only and would be ignored).
+pub const CONTROL_H: f32 = 30.;
 
 const BASE_REM_SIZE: f32 = 16.;
 
@@ -81,9 +89,9 @@ impl ContentWidth {
 ///   two-column grid is sized against this exact value; see its card min-width).
 /// - `CARD_PAD` / `CARD_GAP` — a card's inner padding and its title-to-content
 ///   gap, so every [`panel_card`](crate::app) reads the same.
-pub const SCREEN_PAD: Rems = rems(1.25);
-pub const CARD_PAD: Rems = rems(1.);
-pub const CARD_GAP: Rems = rems(0.75);
+pub const SCREEN_PAD: DynamicSpacing = DynamicSpacing::Base20;
+pub const CARD_PAD: DynamicSpacing = DynamicSpacing::Base16;
+pub const CARD_GAP: DynamicSpacing = DynamicSpacing::Base12;
 
 /// Apple HIG / WCAG minimum contrast for normal text up to 17pt.
 const MIN_TEXT_CONTRAST: f32 = 4.5;

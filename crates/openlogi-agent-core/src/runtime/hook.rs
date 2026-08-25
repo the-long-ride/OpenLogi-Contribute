@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use openlogi_core::binding::{
-    Action, ButtonId, GestureDirection, SwipeAccumulator, default_binding,
+    Action, Binding, ButtonId, GestureDirection, SwipeAccumulator, default_binding,
 };
 use openlogi_core::config::{KeyModifiers, KeyTrigger};
 use openlogi_hook::{
@@ -19,6 +19,7 @@ use openlogi_hook::{
 };
 use tracing::{info, warn};
 
+use super::scroll::ScrollInputHandle;
 use super::{ActionDispatcher, PressToken};
 use crate::event_monitor::SharedEventMonitor;
 
@@ -28,8 +29,8 @@ use crate::event_monitor::SharedEventMonitor;
 /// versa), and the common case reads one lock instead of two.
 #[derive(Default)]
 pub struct HookMaps {
-    /// Per-button single action — the single-action dispatch path.
-    pub bindings: BTreeMap<ButtonId, Action>,
+    /// Per-button immediate or threshold binding — the non-gesture dispatch path.
+    pub bindings: BTreeMap<ButtonId, Binding>,
     /// Per-direction maps for the OS-hook gesture buttons (Middle/Back/Forward in
     /// gesture mode), so a hold+swipe resolves to a bound action. The dedicated
     /// HID++ gesture button (0x00c3) uses the gesture watcher's separate map
@@ -199,6 +200,16 @@ fn button_source_may_remap(device: Option<&EventDevice>) -> bool {
     }
 }
 
+/// Whether a wheel event may be replaced by host-side smooth output.
+///
+/// Native trackpad/pixel gestures always stay untouched. macOS additionally
+/// requires a known Logitech sender; Linux and Windows perform device
+/// selection before this callback and therefore admit their unattributed
+/// wheel events through the same policy as button remapping.
+fn scroll_source_may_intercept(from_trackpad: bool, device: Option<&EventDevice>) -> bool {
+    !from_trackpad && button_source_may_remap(device)
+}
+
 /// Off-thread worker for bound actions so the tap callback never injects input.
 fn spawn_action_worker(dispatcher: ActionDispatcher) -> mpsc::SyncSender<Action> {
     let (tx, rx) = mpsc::sync_channel::<Action>(64);
@@ -273,23 +284,29 @@ fn handle_button(
         }
     }
 
-    let action = hooks
+    let binding = hooks
         .try_read()
         .ok()
         .and_then(|m| m.bindings.get(&id).cloned());
-    let Some(action) = action else {
+    let Some(binding) = binding else {
         return EventDisposition::PassThrough;
     };
-    if is_native_click(id, &action) {
+    if binding_is_native_click(id, &binding) {
         return EventDisposition::PassThrough;
     }
     if pressed {
-        info!(button = %id, action = %action.label(), "button → executing bound action");
-        let queued = dispatcher.try_hook_button_down(id, Some(&action)).is_some();
+        info!(button = %id, action = %binding.click_action().label(), "button → handling binding");
+        let queued = dispatcher
+            .try_hook_button_down(id, Some(&binding))
+            .is_some();
         return FAIL_OPEN_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, queued, s));
     }
     dispatcher.try_hook_button_up(id);
     FAIL_OPEN_PRESSES.with_borrow_mut(|s| remapped_release_disposition(id, s))
+}
+
+fn binding_is_native_click(id: ButtonId, binding: &Binding) -> bool {
+    !matches!(binding, Binding::LongPress(_)) && is_native_click(id, &binding.click_action())
 }
 
 /// Press of a remapped single-action button: suppress when the action was
@@ -411,6 +428,7 @@ pub fn start(
     hooks: SharedHookMaps,
     keyboard_bindings: SharedKeyboardBindings,
     dispatcher: ActionDispatcher,
+    scroll: ScrollInputHandle,
     monitor: SharedEventMonitor,
 ) -> Option<Hook> {
     if !Hook::has_accessibility() {
@@ -442,24 +460,26 @@ pub fn start(
                     HOLD.with_borrow_mut(HoldState::cancel);
                     HELD_KEYS.with_borrow_mut(HashSet::clear);
                     dispatcher.cancel_hook_thread_buttons();
+                    scroll.cancel_hooks();
                     EventDisposition::PassThrough
                 }
                 MouseEvent::Scroll {
-                    delta_x, delta_y, ..
+                    delta,
+                    from_trackpad,
+                    device,
                 } => {
-                    #[cfg(not(target_os = "windows"))]
-                    let _ = (delta_x, delta_y);
                     #[cfg(target_os = "windows")]
-                    if delta_y == 0.0
+                    if delta.y() == 0.0
                         && let Some((button, action)) = hooks
                             .try_read()
                             .ok()
-                            .and_then(|maps| rebound_thumbwheel_action(&maps, delta_x))
+                            .and_then(|maps| rebound_thumbwheel_action(&maps, delta.x()))
                     {
                         info!(button = %button, action = %action.label(), "native thumb wheel → executing bound action");
-                        if try_queue_action(&action_tx, action) {
-                            return EventDisposition::Suppress;
-                        }
+                        return queued_event_disposition(try_queue_action(&action_tx, action));
+                    }
+                    if scroll_source_may_intercept(from_trackpad, device.as_ref()) {
+                        return queued_event_disposition(scroll.try_hook_scroll(delta));
                     }
                     EventDisposition::PassThrough
                 }
@@ -490,7 +510,7 @@ pub fn start(
 /// Windows/MX Master 2S, positive `WM_MOUSEHWHEEL` delta is the physical
 /// backward/down direction, so it maps to `ThumbwheelScrollDown`.
 #[cfg(any(target_os = "windows", test))]
-fn rebound_thumbwheel_action(maps: &HookMaps, delta_x: f32) -> Option<(ButtonId, Action)> {
+fn rebound_thumbwheel_action(maps: &HookMaps, delta_x: f64) -> Option<(ButtonId, Action)> {
     let button = if delta_x > 0.0 {
         ButtonId::ThumbwheelScrollDown
     } else if delta_x < 0.0 {
@@ -498,7 +518,7 @@ fn rebound_thumbwheel_action(maps: &HookMaps, delta_x: f32) -> Option<(ButtonId,
     } else {
         return None;
     };
-    let action = maps.bindings.get(&button)?.clone();
+    let action = maps.bindings.get(&button)?.click_action();
     (action != default_binding(button)).then_some((button, action))
 }
 

@@ -4,11 +4,13 @@ use crate::ui::theme::Typography as _;
 use gpui_base::Button as BaseButton;
 use std::time::Duration;
 
+use crate::ui::components::control_select;
+
 use super::{
     App, AppState, AssetCommand, AssetControl, AssetSourcePreference, Entity, IconName, IndexPath,
-    InteractiveElement, IntoElement, Palette, ParentElement, Select, SelectItem, SelectState,
-    SettingField, SettingGroup, SettingItem, SettingPage, SettingsView, SharedString, Sizable,
-    StateEvent, Styled, div, px,
+    InteractiveElement, IntoElement, Palette, ParentElement, SelectItem, SelectState, SettingField,
+    SettingGroup, SettingItem, SettingPage, SettingsView, SharedString, StateEvent, Styled, div,
+    px,
 };
 
 #[derive(Clone)]
@@ -59,7 +61,6 @@ pub(super) fn selected_source_index(
 pub(super) fn assets_page(
     view: Entity<SettingsView>,
     asset_source_select: Entity<SelectState<Vec<AssetSourceOption>>>,
-    pal: Palette,
     cache_desc: SharedString,
 ) -> SettingPage {
     let refresh_view = view.clone();
@@ -103,8 +104,9 @@ pub(super) fn assets_page(
         .item(
             SettingItem::new(
                 tr!("Refresh assets"),
-                SettingField::render(move |_, _, _| {
+                SettingField::render(move |_, _, cx| {
                     let view = refresh_view.clone();
+                    let pal = crate::ui::theme::palette(cx);
                     action_button("assets-refresh", tr!("Refresh"), pal, move |cx| {
                         send_asset_command(cx, AssetCommand::Refresh);
                         // Give the spawned sync a moment to land small fetches,
@@ -120,8 +122,9 @@ pub(super) fn assets_page(
         .item(
             SettingItem::new(
                 tr!("Clear cache"),
-                SettingField::render(move |_, _, _| {
+                SettingField::render(move |_, _, cx| {
                     let view = view.clone();
+                    let pal = crate::ui::theme::palette(cx);
                     action_button("assets-clear", tr!("Clear"), pal, move |cx| {
                         send_asset_command(cx, AssetCommand::ClearCache);
                         // The wipe runs on the main loop's channel arm, not
@@ -137,7 +140,8 @@ pub(super) fn assets_page(
         .item(
             SettingItem::new(
                 tr!("Cache location"),
-                SettingField::render(move |_, _, _| {
+                SettingField::render(move |_, _, cx| {
+                    let pal = crate::ui::theme::palette(cx);
                     action_button("assets-open", tr!("Open"), pal, |_| {
                         crate::services::assets::reveal_cache_in_file_manager();
                     })
@@ -161,8 +165,7 @@ fn asset_source_select_field(
     asset_source_select: Entity<SelectState<Vec<AssetSourceOption>>>,
 ) -> impl IntoElement {
     div().flex_shrink_0().w(px(220.)).h_6().child(
-        Select::new(&asset_source_select)
-            .small()
+        control_select(&asset_source_select)
             .w(px(220.))
             .menu_width(px(220.)),
     )
