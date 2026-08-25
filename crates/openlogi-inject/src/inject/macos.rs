@@ -12,6 +12,8 @@ use openlogi_core::binding::{
     Action, Effect, KeyCombo, MediaKey, MouseButton, NativeAction, Script, Shortcut, WorkflowStep,
 };
 
+use super::{HeldKey, HeldModifiers, KeyPhase};
+
 // NX_KEYTYPE_* constants from <IOKit/hidsystem/ev_keymap.h>.
 const NX_KEYTYPE_SOUND_UP: i32 = 0;
 const NX_KEYTYPE_SOUND_DOWN: i32 = 1;
@@ -31,7 +33,7 @@ pub(super) fn execute(action: &Action) {
         // this — the hook passes it straight through to the OS.
         Effect::Click(button) => dispatch_click(button),
         Effect::Shortcut(shortcut) => post_keycombo(&combo(shortcut)),
-        Effect::Key(combo) => post_keycombo(combo),
+        Effect::Key(combo) | Effect::HeldKey(combo) => post_keycombo(combo),
         Effect::Scroll { dx, dy } => dispatch_scroll(dx, dy),
         // Media/volume controls are NX system-defined keys, not ordinary
         // keyboard virtual-key events. Posting kVK_Volume* through
@@ -226,24 +228,25 @@ fn tag_synthetic(ev: &CGEvent) {
     );
 }
 
-/// Post a key-down + key-up pair for `vk` with `flags` set.
-fn post_key(vk: u16, flags: CGEventFlags) {
+/// Post one keyboard edge for `vk` with `flags` set.
+fn post_key_phase(vk: u16, flags: CGEventFlags, phase: KeyPhase) {
     let Ok(src) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
         tracing::warn!("CGEventSource::new failed");
         return;
     };
-    let Ok(down) = CGEvent::new_keyboard_event(src.clone(), vk, true) else {
-        tracing::warn!("CGEvent::new_keyboard_event(down) failed");
+    let down = phase == KeyPhase::Down;
+    let Ok(event) = CGEvent::new_keyboard_event(src, vk, down) else {
+        tracing::warn!(?phase, "CGEvent::new_keyboard_event failed");
         return;
     };
-    down.set_flags(flags);
-    down.post(CGEventTapLocation::HID);
-    let Ok(up) = CGEvent::new_keyboard_event(src, vk, false) else {
-        tracing::warn!("CGEvent::new_keyboard_event(up) failed");
-        return;
-    };
-    up.set_flags(flags);
-    up.post(CGEventTapLocation::HID);
+    event.set_flags(flags);
+    event.post(CGEventTapLocation::HID);
+}
+
+/// Post a key-down + key-up pair for `vk` with `flags` set.
+fn post_key(vk: u16, flags: CGEventFlags) {
+    post_key_phase(vk, flags, KeyPhase::Down);
+    post_key_phase(vk, flags, KeyPhase::Up);
 }
 
 /// Type an arbitrary unicode string by emitting one key event per character,
@@ -269,6 +272,85 @@ fn post_unicode(text: &str) {
 /// Press a key chord described by a `KeyCombo` modifier bitmask + virtual
 /// keycode. Used by the workflow sequencer's `PressKey` step.
 fn post_keycombo(combo: &KeyCombo) {
+    if let Some(vk) = hid_usage_to_macos(combo.key().code()) {
+        post_key(vk, combo_flags(combo));
+    } else {
+        tracing::warn!(
+            usage = combo.key().code(),
+            "shortcut usage has no macOS mapping"
+        );
+    }
+}
+
+/// Emit the physical-key edges whose shared ownership changed, preserving the
+/// aggregate synthetic modifier state on every event.
+pub(super) fn hold_keys(
+    keys: &[HeldKey],
+    phase: KeyPhase,
+    mut modifiers: HeldModifiers,
+) -> HeldModifiers {
+    match phase {
+        KeyPhase::Down => {
+            for &key in keys {
+                post_held_key(key, phase, &mut modifiers);
+            }
+        }
+        KeyPhase::Up => {
+            for &key in keys.iter().rev() {
+                post_held_key(key, phase, &mut modifiers);
+            }
+        }
+    }
+    modifiers
+}
+
+fn post_held_key(key: HeldKey, phase: KeyPhase, modifiers: &mut HeldModifiers) {
+    let Some((vk, flags)) = held_key_event(key, phase, modifiers) else {
+        if let HeldKey::Key(usage) = key {
+            tracing::warn!(
+                usage = usage.code(),
+                "held shortcut usage has no macOS mapping — edge ignored"
+            );
+        }
+        return;
+    };
+    post_key_phase(vk, flags, phase);
+}
+
+fn held_key_event(
+    key: HeldKey,
+    phase: KeyPhase,
+    modifiers: &mut HeldModifiers,
+) -> Option<(u16, CGEventFlags)> {
+    modifiers.set(key, phase == KeyPhase::Down);
+    let vk = match key {
+        HeldKey::Command => Some(0x37),
+        HeldKey::Shift => Some(0x38),
+        HeldKey::Alt => Some(0x3a),
+        HeldKey::Control => Some(0x3b),
+        HeldKey::Key(usage) => hid_usage_to_macos(usage.code()),
+    }?;
+    Some((vk, held_modifier_flags(*modifiers)))
+}
+
+fn held_modifier_flags(modifiers: HeldModifiers) -> CGEventFlags {
+    let mut flags = CGEventFlags::CGEventFlagNull;
+    if modifiers.contains(HeldKey::Command) {
+        flags |= CGEventFlags::CGEventFlagCommand;
+    }
+    if modifiers.contains(HeldKey::Shift) {
+        flags |= CGEventFlags::CGEventFlagShift;
+    }
+    if modifiers.contains(HeldKey::Control) {
+        flags |= CGEventFlags::CGEventFlagControl;
+    }
+    if modifiers.contains(HeldKey::Alt) {
+        flags |= CGEventFlags::CGEventFlagAlternate;
+    }
+    flags
+}
+
+fn combo_flags(combo: &KeyCombo) -> CGEventFlags {
     let mut flags = CGEventFlags::CGEventFlagNull;
     if combo.has_command() {
         flags |= CGEventFlags::CGEventFlagCommand;
@@ -282,14 +364,7 @@ fn post_keycombo(combo: &KeyCombo) {
     if combo.has_option() {
         flags |= CGEventFlags::CGEventFlagAlternate;
     }
-    if let Some(vk) = hid_usage_to_macos(combo.key().code()) {
-        post_key(vk, flags);
-    } else {
-        tracing::warn!(
-            usage = combo.key().code(),
-            "shortcut usage has no macOS mapping"
-        );
-    }
+    flags
 }
 
 /// Map a platform-neutral USB HID keyboard usage to a macOS virtual key.
@@ -339,9 +414,11 @@ fn hid_usage_to_macos(usage: u8) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
+    use core_graphics::event::CGEventFlags;
     use openlogi_core::binding::Shortcut;
 
-    use super::{combo, hid_usage_to_macos};
+    use super::{combo, held_key_event, hid_usage_to_macos};
+    use crate::inject::{HeldKey, HeldModifiers, KeyPhase};
 
     #[test]
     fn hid_usages_map_to_macos_virtual_keys() {
@@ -377,6 +454,30 @@ mod tests {
                 "{shortcut:?} table entry has no macOS virtual-key mapping"
             );
         }
+    }
+
+    #[test]
+    fn held_edges_carry_the_aggregate_modifier_state() {
+        let mut modifiers = HeldModifiers::default();
+        let (_, flags) = held_key_event(HeldKey::Command, KeyPhase::Down, &mut modifiers)
+            .expect("Command has a macOS virtual-key mapping");
+        assert!(flags.contains(CGEventFlags::CGEventFlagCommand));
+
+        let (_, flags) = held_key_event(HeldKey::Control, KeyPhase::Down, &mut modifiers)
+            .expect("Control has a macOS virtual-key mapping");
+        assert!(flags.contains(CGEventFlags::CGEventFlagCommand));
+        assert!(flags.contains(CGEventFlags::CGEventFlagControl));
+
+        let key = combo(Shortcut::Copy).key();
+        let (_, flags) = held_key_event(HeldKey::Key(key), KeyPhase::Up, &mut modifiers)
+            .expect("Copy's key has a macOS virtual-key mapping");
+        assert!(flags.contains(CGEventFlags::CGEventFlagCommand));
+        assert!(flags.contains(CGEventFlags::CGEventFlagControl));
+
+        let (_, flags) = held_key_event(HeldKey::Command, KeyPhase::Up, &mut modifiers)
+            .expect("Command has a macOS virtual-key mapping");
+        assert!(!flags.contains(CGEventFlags::CGEventFlagCommand));
+        assert!(flags.contains(CGEventFlags::CGEventFlagControl));
     }
 }
 
@@ -501,14 +602,18 @@ fn dispatch_scroll(dx: i8, dy: i8) {
     ev.post(CGEventTapLocation::HID);
 }
 
-/// Post a horizontal scroll of `delta` lines (wheel2 axis). Line units suit
-/// the thumb wheel's ratchet-like increments better than pixels.
-pub(super) fn post_horizontal_scroll(delta: i32) {
+/// Post `(delta_x, delta_y)` scroll lines. Line units suit the thumb wheel's
+/// ratchet-like increments better than pixels.
+pub(super) fn post_scroll(delta_x: i32, delta_y: i32) {
+    if delta_x == 0 && delta_y == 0 {
+        return;
+    }
     let Ok(src) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
         tracing::warn!("CGEventSource::new failed for thumbwheel scroll");
         return;
     };
-    let Ok(ev) = CGEvent::new_scroll_event(src, ScrollEventUnit::LINE, 2, 0, delta, 0) else {
+    let Ok(ev) = CGEvent::new_scroll_event(src, ScrollEventUnit::LINE, 2, delta_y, delta_x, 0)
+    else {
         tracing::warn!("CGEvent::new_scroll_event failed for thumbwheel");
         return;
     };

@@ -45,6 +45,7 @@ use crate::features::mouse::picker::{
 };
 use crate::services::assets::{GlowGeometry, ResolvedAsset};
 use crate::state::{AppState, DeviceRecord, StateEvent};
+use crate::ui::action::localized_action_label;
 use crate::ui::components::MenuRow;
 use crate::ui::theme::{self, ACCENT_BLUE, Palette, Typography as _};
 use gpui::ease_in_out;
@@ -243,7 +244,7 @@ impl Render for FunctionRowView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = AppState::try_read(cx);
         let asset = state.and_then(|state| state.current_record()?.asset.as_ref());
-        let bindings = state.map(|state| &state.keyboard_bindings);
+        let bindings = state.map(AppState::keyboard_bindings);
         let glow = state.and_then(|state| {
             state
                 .current_record()
@@ -666,8 +667,7 @@ fn key_click_target(
 
 fn binding_label(action: Option<&Action>) -> gpui::SharedString {
     match action {
-        Some(Action::CustomShortcut(combo)) => combo.rendered_label().into(),
-        Some(a) => tr!(a.label()),
+        Some(action) => localized_action_label(action),
         None => tr!("Off"),
     }
 }
@@ -803,8 +803,8 @@ impl FunctionRowView {
             );
         }
 
-        let current =
-            AppState::try_read(cx).and_then(|s| s.keyboard_bindings.get(&trigger).cloned());
+        let current = AppState::try_read(cx)
+            .and_then(|state| state.keyboard_bindings().get(&trigger).cloned());
 
         let view_for_pick = view.clone();
         let trigger_for_pick = trigger.clone();

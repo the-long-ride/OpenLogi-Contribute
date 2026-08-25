@@ -34,24 +34,30 @@ be copied manually to the generated physical keys.
 
 ## Shape
 
-`schema_version` is required and currently `4`. `selected_device` is an
+`schema_version` is required and currently `5`. `selected_device` is an
 optional physical device key.
 
 `[app_settings]` contains application-wide preferences:
 
 - startup, update, menu-bar / tray, input-capture, and asset-download toggles
 - `asset_source`: `automatic`, `openlogi`, `cloudflare`, or `fastly`
-- `language`, `appearance`, optional theme names, and optional UI radius
+- `language`, `appearance`, `device_view_mode` (`grid`, `list`, or `carousel`),
+  optional theme names, and optional UI radius
 - `thumbwheel_sensitivity`, from `1` through `100` (`14` is 1×)
 
 `[devices."<physical-key>"]` contains per-device state. Receiver keys look like
 `receiver:<receiver-id>:slot:<number>`; direct, raw-HID, and camera devices use
 other generated keys. Do not substitute a model id such as `2b042`.
 
+A camera without a USB serial has no unique port-stable identity. Its
+`custom_name` key therefore follows the OS capture id so two same-model cameras
+remain distinguishable; moving it to another USB port may require naming it
+again.
+
 Common device fields are:
 
-- `enabled`, `dpi`, `dpi_presets`, thumb-wheel sensitivity, scroll inversion,
-  and scroll resolution
+- `custom_name`, `enabled`, `dpi`, `dpi_presets`, thumb-wheel sensitivity,
+  scroll inversion, and scroll resolution
 - `bindings`: a button maps either to one action or to a gesture-direction map.
   `Thumbwheel` is the thumb wheel's capacitive tap — it has no GUI control and
   stays inert unless bound here, because the wheel reports taps from incidental
@@ -81,8 +87,14 @@ Payload actions use a one-key inline table:
 
 ```toml
 Back = { CustomShortcut = "Cmd+Shift+P" }
+Forward = { HoldShortcut = "Ctrl+Space" }
 MiddleClick = { OpenApplication = { path = "~/Downloads", display_name = "Downloads" } }
 ```
+
+`CustomShortcut` emits an immediate key-down/key-up pair. `HoldShortcut` keeps
+the chord down until the originating physical button is released, and also
+releases it if capture is interrupted, the binding becomes invalid, or the
+agent shuts down. Use it for push-to-talk and other hold-to-activate controls.
 
 An Actions Ring entry wraps the action and may add an icon or literal label:
 

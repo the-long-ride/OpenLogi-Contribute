@@ -12,7 +12,7 @@ use gpui_component::{
 };
 
 use crate::app::menu::OpenConfigFolder;
-use crate::ui::theme::{self, FOOTER_H, Palette, Typography as _};
+use crate::ui::theme::{self, ContentWidth, FOOTER_H, Palette, Typography as _};
 
 /// Centered spinner over a muted one-line caption — the quiet "still working"
 /// body shared by the pre-connection frame and the scanning state, so the two
@@ -50,7 +50,7 @@ pub(super) fn notice_body(headline: SharedString, caption: SharedString, pal: Pa
         .child(div().text_title().child(headline))
         .child(
             div()
-                .max_w(px(440.))
+                .max_w(ContentWidth::Narrow.rems())
                 .text_body()
                 .text_center()
                 .text_color(pal.text_muted)
@@ -150,17 +150,21 @@ pub(super) fn attention_footer(pal: Palette) -> impl IntoElement {
 #[cfg(target_os = "macos")]
 fn accessibility_status(pal: Palette) -> AnyElement {
     // Scoped here rather than at module level: these traits' only user is this
-    // macOS-gated affordance (`.id()` + `.on_click()`), so an ungated import
+    // macOS-gated affordance (`.hover()` + `.on_click()`), so an ungated import
     // would be unused — and a hard error under `-D warnings` — on Linux/Windows.
-    use gpui::{InteractiveElement as _, StatefulInteractiveElement as _};
+    use gpui::InteractiveElement as _;
+    use gpui_base::Button as BaseButton;
 
-    h_flex()
-        .id("footer-accessibility")
+    BaseButton::new("footer-accessibility")
+        .accessibility_label(tr!("Accessibility not granted · click to grant"))
+        .flex()
         .gap_2()
         .items_center()
         .text_caption()
         .text_color(pal.text_primary)
         .cursor_pointer()
+        .hover(|style| style.text_color(pal.text_muted))
+        .focus_visible(|style| style.text_color(pal.text_muted))
         .child(
             div()
                 .size_1p5()

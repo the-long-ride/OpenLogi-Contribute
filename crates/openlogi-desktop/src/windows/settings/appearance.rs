@@ -1,7 +1,7 @@
 //! Appearance settings page: mode, theme grid, radius, scale, language.
 
 use super::language::{LanguageOption, language_select_field};
-use gpui::img;
+use gpui::{ElementId, img};
 use openlogi_core::config::AppIcon;
 
 use super::{
@@ -13,6 +13,7 @@ use super::{
     v_flex,
 };
 use crate::platform::app_icon;
+use crate::ui::choice_card::ChoiceCard;
 use crate::ui::theme::Typography as _;
 
 /// The Appearance page: light/dark mode, the theme grid, corner radius, and the
@@ -221,11 +222,12 @@ fn mode_card(
             ),
         });
 
-    v_flex()
-        .id(id)
+    ChoiceCard::new(id, label.clone())
+        .selected(selected)
         .gap(px(6.))
         .items_center()
         .cursor_pointer()
+        .focus_visible(move |style| style.text_color(pal.text_primary))
         .child(thumb)
         .child(
             h_flex()
@@ -254,11 +256,12 @@ fn icon_picker(pal: Palette, cx: &App) -> gpui::Div {
 /// the app is wearing.
 fn icon_card(icon: AppIcon, selected: bool, accent: Hsla, pal: Palette) -> impl IntoElement {
     let preview = app_icon::preview(icon);
-    v_flex()
-        .id(SharedString::from(icon.to_string()))
+    ChoiceCard::new(SharedString::from(icon.to_string()), icon_label(icon))
+        .selected(selected)
         .gap(px(6.))
         .items_center()
         .cursor_pointer()
+        .focus_visible(move |style| style.text_color(pal.text_primary))
         .child(
             div()
                 .size(px(80.))
@@ -409,7 +412,7 @@ fn scale_segment(cx: &App) -> ButtonGroup {
     ButtonGroup::new("interface-scale")
         .outline()
         .children(UiScale::ALL.map(|scale| {
-            Button::new(format!("interface-scale-{}", scale.percent()))
+            Button::new(("interface-scale", u32::from(scale.percent())))
                 .label(format!("{}%", scale.percent()))
                 .selected(current == scale)
         }))
@@ -472,15 +475,10 @@ fn theme_picker(
             grid.flex()
                 .flex_wrap()
                 .gap_2()
-                .children(
-                    themes
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, (name, mode, swatch))| {
-                            let selected = name == active;
-                            theme_card(i, name, mode, swatch, selected, pal)
-                        }),
-                )
+                .children(themes.into_iter().map(|(name, mode, swatch)| {
+                    let selected = name == active;
+                    theme_card(name, mode, swatch, selected, pal)
+                }))
         });
 
     v_flex()
@@ -564,7 +562,6 @@ struct Swatch {
 }
 
 fn theme_card(
-    index: usize,
     name: SharedString,
     mode: ThemeMode,
     swatch: Swatch,
@@ -573,8 +570,8 @@ fn theme_card(
 ) -> impl IntoElement {
     let dark = mode.is_dark();
     let stored = name.clone();
-    v_flex()
-        .id(("theme", index))
+    ChoiceCard::new((ElementId::from("theme"), name.clone()), name.clone())
+        .selected(selected)
         .w(px(132.))
         .p(px(8.))
         .gap_2()
@@ -592,6 +589,7 @@ fn theme_card(
                 style.border_color(pal.text_muted)
             }
         })
+        .focus_visible(move |style| style.border_color(swatch.primary).shadow_sm())
         .active(gpui::Styled::shadow_2xs)
         .child(
             v_flex()
@@ -674,8 +672,8 @@ fn filter_chip(
 ) -> impl IntoElement {
     let selected = value == current;
     let view = view.clone();
-    div()
-        .id(id)
+    ChoiceCard::new(id, label.clone())
+        .selected(selected)
         .px_3()
         .py_1()
         .rounded_full()
@@ -690,6 +688,7 @@ fn filter_chip(
                 this.border_color(pal.border)
                     .text_color(pal.text_muted)
                     .hover(|h| h.border_color(pal.text_muted))
+                    .focus_visible(|h| h.border_color(pal.text_muted))
             }
         })
         .child(label)
