@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use hidpp::{channel::HidppChannel, device::Device, protocol::v20};
 use openlogi_core::binding::{ButtonId, GestureDirection, SwipeAccumulator};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -57,16 +56,14 @@ pub enum CaptureStop {
 }
 
 /// One input captured from the active device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapturedInput {
     /// A completed swipe (or tap click) from a diverted gesture source,
     /// tagged with the source control so dispatch resolves it against that
     /// button's own direction map.
     Gesture(ButtonId, GestureDirection),
-    /// A diverted button was pressed — the DPI/ModeShift button
-    /// ([`ButtonId::DpiToggle`]) or the thumb-wheel single tap
-    /// ([`ButtonId::Thumbwheel`]).
-    ButtonPressed(ButtonId, #[serde(skip)] Option<i32>),
+    /// A diverted button's physical down edge.
+    ButtonDown(ButtonId),
     /// Thumb-wheel rotation to re-synthesise as horizontal scroll. Emitted
     /// while the wheel is diverted (click bound, rotation rebound, or
     /// sensitivity changed).
@@ -79,6 +76,11 @@ pub enum CapturedInput {
         /// report.
         resolution: WheelResolution,
     },
+    /// A diverted button's physical up edge.
+    ButtonUp(ButtonId),
+    /// An instantaneous firmware-reported tap with no observable hold
+    /// duration, such as the thumb-wheel touch sensor.
+    ButtonPulse(ButtonId),
 }
 
 /// Why a capture session could not start (or had to stop).
@@ -349,7 +351,7 @@ fn thumbwheel_input(
     }
     event
         .single_tap
-        .then_some(CapturedInput::ButtonPressed(ButtonId::Thumbwheel, None))
+        .then_some(CapturedInput::ButtonPulse(ButtonId::Thumbwheel))
 }
 
 /// Reason-aware capture: maps stop reasons onto a unit oneshot shutdown.
@@ -635,10 +637,9 @@ pub(crate) async fn enumerate_controls(
     Ok(controls)
 }
 
-/// Update `acc` and emit on a decoded `0x1b04` event: commit a gesture swipe the
-/// instant it crosses the threshold (mid-swipe, like Options+) rather than on
-/// release, and emit a [`ButtonId::DpiToggle`] press on the rising edge of any
-/// diverted DPI/ModeShift control.
+/// Update `acc` and emit on a decoded `0x1b04` event: preserve physical button
+/// edges, and commit a gesture swipe the instant it crosses the threshold
+/// (mid-swipe, like Options+) rather than on release.
 fn handle_reprog(
     acc: &mut CaptureAccum,
     event: RawControlEvent,
@@ -691,11 +692,29 @@ fn handle_reprog(
                     }
                 }
             }
+            // Gesture semantics stay separate from the physical lifecycle:
+            // click/swipe remains one completed action, while every armed
+            // source also contributes one rising and one falling edge to the
+            // shared button runtime.
+            for &cid in &acc.gestures_down {
+                if !held.iter().any(|(held_cid, _)| *held_cid == cid)
+                    && let Some(button) = gesture_source_button(cid)
+                {
+                    let _ = sink.send(CapturedInput::ButtonUp(button));
+                }
+            }
+            for &(cid, button) in &held {
+                if !acc.gestures_down.contains(&cid) {
+                    let _ = sink.send(CapturedInput::ButtonDown(button));
+                }
+            }
             acc.gestures_down = held.into_iter().map(|(cid, _)| cid).collect();
 
             let dpi_down = dpi_cids.iter().any(|cid| cids.contains(cid));
             if dpi_down && !acc.dpi_down {
-                let _ = sink.send(CapturedInput::ButtonPressed(ButtonId::DpiToggle, None));
+                let _ = sink.send(CapturedInput::ButtonDown(ButtonId::DpiToggle));
+            } else if !dpi_down && acc.dpi_down {
+                let _ = sink.send(CapturedInput::ButtonUp(ButtonId::DpiToggle));
             }
             acc.dpi_down = dpi_down;
 
@@ -703,9 +722,10 @@ fn handle_reprog(
                 let down = cids.contains(&cid);
                 let was_down = acc.buttons_down.contains(&cid);
                 if down && !was_down {
-                    let _ = sink.send(CapturedInput::ButtonPressed(button, None));
+                    let _ = sink.send(CapturedInput::ButtonDown(button));
                     acc.buttons_down.push(cid);
                 } else if !down && was_down {
+                    let _ = sink.send(CapturedInput::ButtonUp(button));
                     acc.buttons_down.retain(|&c| c != cid);
                 }
             }

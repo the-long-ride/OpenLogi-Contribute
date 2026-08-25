@@ -271,7 +271,7 @@ fn dpi_panel_snapshot(cx: &mut Context<DpiPanel>) -> DpiPanelSnapshot {
             let record = s.current_record()?;
             let device_key = record.device_key();
             Some(DpiPanelSnapshot {
-                status: s.reads.dpi.status(&device_key),
+                status: s.reads.dpi_status(&device_key),
                 device_key,
                 dpi: s.dpi,
                 presets: s.dpi_presets(),
@@ -322,16 +322,19 @@ fn slider_element(
                 tr!("Fixed DPI: %{dpi}", dpi => info.capabilities.min()),
                 pal,
             )
+            .into_any_element()
         }
         (DpiStatus::Ready(_), Some(slider_state)) => {
             Slider::new(slider_state).horizontal().into_any_element()
         }
-        (DpiStatus::Ready(_), None) => status_line(tr!("Preparing DPI slider…"), pal),
+        (DpiStatus::Ready(_), None) => {
+            status_line(tr!("Preparing DPI slider…"), pal).into_any_element()
+        }
         (DpiStatus::Unknown | DpiStatus::Loading, _) if !reachable => {
-            status_line(tr!("Device offline — DPI unavailable."), pal)
+            status_line(tr!("Device offline — DPI unavailable."), pal).into_any_element()
         }
         (DpiStatus::Unknown | DpiStatus::Loading, _) => {
-            status_line(tr!("Reading supported DPI values…"), pal)
+            status_line(tr!("Reading supported DPI values…"), pal).into_any_element()
         }
         // Clickable: reselecting is a no-op for a single-device carousel, so the
         // retry must work in place.
@@ -342,11 +345,13 @@ fn slider_element(
             move |cx| {
                 AppState::retry_dpi_read(cx, key.clone());
             },
-        ),
+        )
+        .into_any_element(),
         (DpiStatus::Unsupported(_), _) => status_line(
             tr!("This device did not report Adjustable DPI support."),
             pal,
-        ),
+        )
+        .into_any_element(),
     }
 }
 

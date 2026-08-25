@@ -27,8 +27,7 @@ use tracing::warn;
 pub(crate) use device_key::DeviceKey;
 pub use devices::DeviceRecord;
 pub use light::LightCommandStatus;
-#[cfg(test)]
-pub use load::Load;
+pub(crate) use load::Load;
 pub use load::{DpiStatus, SmartShiftLoad};
 
 /// Result of confirming a SmartShift write by reading the value back.
@@ -49,9 +48,9 @@ pub enum SmartShiftWriteStatus {
 
 use device_ui::DeviceUiState;
 pub(crate) use devices::camera_model_info;
-use load::DeviceReads;
 
 use crate::services::assets::AssetResolver;
+use crate::services::device_reads::DeviceReads;
 use crate::state::devices::{build_device_list, pick_initial_device};
 
 mod agent;
@@ -211,6 +210,11 @@ pub struct AppState {
     editing_scope: Option<EditingScope>,
     /// Aggregate host-camera activity reported by the agent. Runtime only.
     camera_active: bool,
+    /// Camera-consent poll started by an in-app macOS prompt. The app-state
+    /// entity owns it because permission can resolve after the initiating view
+    /// or window closes; dropping the entity at process shutdown cancels it.
+    #[cfg(target_os = "macos")]
+    camera_permission_poll: Option<gpui::Task<()>>,
     /// Per-device UI state outside the persisted config and the lazily-loaded
     /// DPI/SmartShift reads ([`Self::reads`]) —
     /// manual camera-light overrides, volatile light settings, in-flight
@@ -221,7 +225,7 @@ pub struct AppState {
     light_command_status: Option<(DeviceKey, u64, LightCommandStatus)>,
     next_light_request_id: u64,
     /// The hotspot the user most recently armed by clicking. Drives the
-    /// "selected button" outline on the mouse model and the popover content.
+    /// "selected button" outline on the mouse model and inspector content.
     pub active_button: Option<ButtonId>,
     /// Everything the GUI knows about the agent connection — the last status
     /// snapshot, or why there isn't one. The render path branches on this
@@ -231,11 +235,13 @@ pub struct AppState {
     /// Bindings for the *currently selected* device. Reloaded whenever the
     /// carousel selection changes.
     pub button_bindings: BTreeMap<ButtonId, Action>,
-    /// Per-direction sub-bindings for every gesture-mode button of the current
-    /// device, keyed by button. Edited via each button's gesture menu and
-    /// persisted as that button's [`Binding::Gesture`] entry in the device's
-    /// unified binding map ([`DeviceConfig::bindings`]). Rebuilt by
-    /// [`Self::current_gesture_maps`].
+    /// Cached per-direction sub-bindings for every gesture-mode button of the
+    /// current device's global profile, keyed by button. The cache remains
+    /// populated while editing a per-app profile so the inspector can describe
+    /// inherited gestures without rebuilding the maps during rendering. Edited
+    /// via each button's gesture menu and persisted as that button's
+    /// [`Binding::Gesture`] entry in the device's unified binding map
+    /// ([`DeviceConfig::bindings`]).
     ///
     /// [`DeviceConfig::bindings`]: openlogi_core::config::DeviceConfig::bindings
     pub gesture_bindings: BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>>,
@@ -246,11 +252,9 @@ pub struct AppState {
     /// Sorted (`BTreeMap`) for stable render order in the function-row view.
     pub keyboard_bindings: BTreeMap<KeyTrigger, Action>,
     pub dpi: Dpi,
-    /// Lazily-loaded DPI and SmartShift read caches, keyed by [`DeviceKey`].
-    /// HID++ reads must not block device switching or rendering, so callers
-    /// reach these directly (`state.reads.dpi.retry(&key)`,
-    /// `state.reads.smartshift.status(&key)`, …) rather than through a
-    /// per-subsystem forwarding method.
+    /// SWR-backed DPI and SmartShift reads keyed by [`DeviceKey`]. HID++ reads
+    /// must not block device switching or rendering; feature modules project
+    /// this service into synchronous [`Load`] values for their render paths.
     pub(crate) reads: DeviceReads,
     /// Monotonic identity assigned to the next confirmable SmartShift write.
     next_smartshift_write_id: u64,
@@ -364,6 +368,8 @@ impl AppState {
             foreground: ForegroundApps::default(),
             editing_scope: None,
             camera_active: false,
+            #[cfg(target_os = "macos")]
+            camera_permission_poll: None,
             device_ui: BTreeMap::new(),
             light_command_status: None,
             next_light_request_id: 0,
@@ -394,7 +400,7 @@ impl AppState {
             state.persist_config("device identity");
         }
         state.button_bindings = state.bindings_for_current();
-        state.gesture_bindings = state.current_gesture_maps();
+        state.gesture_bindings = state.device_gesture_maps();
         // Keyboard bindings are global, so they seed straight from the config
         // map — no per-device resolution like mouse bindings above.
         state.keyboard_bindings = state
@@ -461,7 +467,7 @@ impl AppState {
     fn restore_persisted_config(&mut self) {
         self.config.clone_from(&self.persisted_config);
         self.button_bindings = self.bindings_for_current();
-        self.gesture_bindings = self.current_gesture_maps();
+        self.gesture_bindings = self.device_gesture_maps();
         self.keyboard_bindings = self.config.keyboard.bindings.clone();
         if let Some(dpi) = self
             .current_record()
@@ -551,7 +557,7 @@ impl AppState {
             )
             .map(|(app, device_key)| EditingScope { device_key, app });
         self.button_bindings = self.bindings_for_current();
-        self.gesture_bindings = self.current_gesture_maps();
+        self.gesture_bindings = self.device_gesture_maps();
     }
 
     /// Whether the active device can carry saved configuration at all. A

@@ -1,6 +1,7 @@
 //! AppState unit tests.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use openlogi_core::binding::{Action, Binding, ButtonId};
 use openlogi_core::config::{
@@ -331,6 +332,10 @@ fn a_gesture_button_stays_one_when_the_scope_returns_to_the_default_profile() {
 
     state.set_editing_app(Some("com.apple.Safari".into()));
     assert!(state.current_gesture_maps().is_empty());
+    assert_eq!(
+        state.gesture_bindings, global,
+        "the inspector cache keeps inherited gestures while per-app editing hides their controls"
+    );
     // The device still has its gestures — only the open profile cannot show
     // them, which is what the device card must keep reporting.
     assert_eq!(
@@ -655,25 +660,27 @@ fn smartshift_write_feedback_requires_the_written_value() {
     };
     assert_eq!(smartshift_write_outcome(expected, None), None);
     assert_eq!(
-        smartshift_write_outcome(expected, Some(&Load::Ready(expected))),
+        smartshift_write_outcome(expected, Some(&Load::Ready(Arc::new(expected)))),
         Some(SmartShiftWriteStatus::Confirmed)
     );
     assert_eq!(
         smartshift_write_outcome(
             expected,
-            Some(&Load::Ready(SmartShiftStatus {
+            Some(&Load::Ready(Arc::new(SmartShiftStatus {
                 auto_disengage: SmartShiftAutoDisengage::Threshold(
                     SmartShiftThreshold::from_rounded(13.0),
                 ),
                 ..expected
-            })),
+            }))),
         ),
         Some(SmartShiftWriteStatus::Failed)
     );
     assert_eq!(
         smartshift_write_outcome(
             expected,
-            Some(&Load::<SmartShiftStatus>::Failed("timeout".to_string(),))
+            Some(&Load::<Arc<SmartShiftStatus>>::Failed(
+                "timeout".to_string(),
+            ))
         ),
         Some(SmartShiftWriteStatus::Failed)
     );
