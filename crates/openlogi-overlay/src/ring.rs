@@ -274,37 +274,130 @@ impl Render for RingView {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "native cursor coordinates are screen-sized and exactly usable as GPUI f32 pixels"
+    reason = "monitor-sized logical coordinates retain sufficient precision as GPUI f32 pixels"
 )]
+fn cursor_in_logical_display(
+    cursor: (f64, f64),
+    native_origin: (f64, f64),
+    native_size: (f64, f64),
+    logical_bounds: &Bounds<Pixels>,
+) -> Option<Point<Pixels>> {
+    let logical_width = f64::from(logical_bounds.size.width.as_f32());
+    let logical_height = f64::from(logical_bounds.size.height.as_f32());
+    if native_size.0 <= 0.0
+        || native_size.1 <= 0.0
+        || logical_width <= 0.0
+        || logical_height <= 0.0
+    {
+        return None;
+    }
+    let scale_x = native_size.0 / logical_width;
+    let scale_y = native_size.1 / logical_height;
+    if !scale_x.is_finite() || !scale_y.is_finite() || scale_x <= 0.0 || scale_y <= 0.0 {
+        return None;
+    }
+    Some(point(
+        logical_bounds.origin.x + px(((cursor.0 - native_origin.0) / scale_x) as f32),
+        logical_bounds.origin.y + px(((cursor.1 - native_origin.1) / scale_y) as f32),
+    ))
+}
+
+#[cfg(target_os = "windows")]
+#[expect(
+    unsafe_code,
+    clippy::cast_possible_truncation,
+    reason = "Win32 monitor lookup consumes i32 device pixels and GPUI DisplayId mirrors the HMONITOR value"
+)]
+fn native_cursor_placement(
+    cx: &mut gpui::App,
+    x: f64,
+    y: f64,
+) -> Option<(gpui::DisplayId, Point<Pixels>, Bounds<Pixels>)> {
+    use windows_sys::Win32::{
+        Foundation::POINT as NativePoint,
+        Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint},
+    };
+
+    let cursor = NativePoint {
+        x: x.round() as i32,
+        y: y.round() as i32,
+    };
+    // SAFETY: `cursor` is a plain screen-space point.
+    let monitor = unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) };
+    if monitor.is_null() {
+        return None;
+    }
+    let display_id = gpui::DisplayId::from(u64::try_from(monitor as usize).ok()?);
+    let logical_bounds = cx
+        .displays()
+        .into_iter()
+        .find(|display| display.id() == display_id)?
+        .bounds();
+
+    let mut monitor_info = MONITORINFO {
+        cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>()).ok()?,
+        ..Default::default()
+    };
+    // SAFETY: `monitor` came from MonitorFromPoint and `monitor_info` has the
+    // required structure size initialized.
+    if unsafe { GetMonitorInfoW(monitor, &raw mut monitor_info) } == 0 {
+        return None;
+    }
+    let native_origin = (
+        f64::from(monitor_info.rcMonitor.left),
+        f64::from(monitor_info.rcMonitor.top),
+    );
+    let native_size = (
+        f64::from(monitor_info.rcMonitor.right - monitor_info.rcMonitor.left),
+        f64::from(monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top),
+    );
+    let center = cursor_in_logical_display((x, y), native_origin, native_size, &logical_bounds)?;
+    Some((display_id, center, logical_bounds))
+}
+
+#[cfg(not(target_os = "windows"))]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "native display coordinates are monitor-sized and retain sufficient precision as GPUI f32 pixels"
+)]
+fn native_cursor_placement(
+    _cx: &mut gpui::App,
+    x: f64,
+    y: f64,
+) -> Option<(gpui::DisplayId, Point<Pixels>, Bounds<Pixels>)> {
+    let display = platform::display_containing(x, y)?;
+    Some((
+        gpui::DisplayId::from(display.id),
+        point(
+            px((x - display.origin.0) as f32),
+            px((y - display.origin.1) as f32),
+        ),
+        Bounds::new(
+            Point::default(),
+            Size::new(px(display.size.0 as f32), px(display.size.1 as f32)),
+        ),
+    ))
+}
+
 pub(crate) fn ring_window_options(cx: &mut gpui::App, show: bool) -> WindowOptions {
     let cursor = openlogi_hook::cursor_position();
     let size = Size::new(px(WINDOW_SIZE), px(WINDOW_SIZE));
-    // GPUI window bounds are display-relative (`display.bounds()` zeroes every
-    // origin) while the hook reports the cursor in global coordinates, so the
-    // cursor's display must be resolved natively and the cursor translated into
-    // that display's space. Feeding the global point straight into the clamp
-    // pins a ring triggered on a secondary display to the primary one's edge.
-    let native_display = cursor
+    // The hook reports a global native cursor. Resolve the native display first
+    // so Windows can translate device pixels into that display's GPUI logical
+    // coordinate space before WindowOptions is built. On macOS, the existing
+    // display-relative CoreGraphics path is preserved.
+    let native_placement = cursor
         .as_ref()
-        .and_then(|cursor| platform::display_containing(cursor.x, cursor.y));
+        .and_then(|cursor| native_cursor_placement(cx, cursor.x, cursor.y));
     let (display_id, center, display_bounds) =
-        if let (Some(cursor), Some(display)) = (&cursor, native_display) {
-            (
-                Some(gpui::DisplayId::from(display.id)),
-                point(
-                    px((cursor.x - display.origin.0) as f32),
-                    px((cursor.y - display.origin.1) as f32),
-                ),
-                Some(Bounds::new(
-                    Point::default(),
-                    Size::new(px(display.size.0 as f32), px(display.size.1 as f32)),
-                )),
-            )
+        if let Some((display_id, center, display_bounds)) = native_placement {
+            (Some(display_id), center, Some(display_bounds))
         } else {
-            // No cursor or no native lookup (non-macOS): GPUI's own display
-            // list, centering on the display when the cursor is unknown.
+            // No cursor or no native lookup: use GPUI's display list, centering
+            // on the primary display when the cursor cannot be resolved.
             let cursor_point = cursor
                 .as_ref()
                 .map(|cursor| point(px(cursor.x as f32), px(cursor.y as f32)));
@@ -363,6 +456,23 @@ mod tests {
         assert!(session_targets(12, Some(12)));
         assert!(!session_targets(11, Some(12)));
         assert!(!session_targets(12, None));
+    }
+
+    #[test]
+    fn windows_mixed_dpi_secondary_cursor_maps_to_gpui_space() {
+        let logical_bounds = Bounds::new(
+            point(px(1280.0), px(0.0)),
+            Size::new(px(1280.0), px(720.0)),
+        );
+        assert_eq!(
+            cursor_in_logical_display(
+                (2880.0, 540.0),
+                (1920.0, 0.0),
+                (1920.0, 1080.0),
+                &logical_bounds,
+            ),
+            Some(point(px(1920.0), px(360.0)))
+        );
     }
 
     #[test]
